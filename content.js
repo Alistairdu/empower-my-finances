@@ -1421,13 +1421,6 @@
     card.dataset.ecdStyled = '1';
   }
 
-  // Change over a window, measured against the point nearest that many days
-  // before the last one rather than an index offset back: the history has gaps
-  // (weekends, a missed sync), and counting rows would quietly slide the
-  // window to the wrong dates.
-  // The long window printed bottom-left, matching the one Empower shows.
-  const CHANGE_WINDOW = 90;
-
   // What moved between two points of the series, carrying enough of both ends
   // to say honestly what was compared.
   function changeAt(a, b) {
@@ -1439,100 +1432,148 @@
     return { delta: b.value - a.value, days: span, from, to, a, b };
   }
 
-  function changeOver(days) {
+  // The figure bottom-left is the whole graph: first point to last. Not a fixed
+  // 90-day window — the graph draws SPARK_DAYS of history, so a 90-day figure
+  // under a 180-day picture is a number you cannot check against what you are
+  // looking at, and the two won't agree because they aren't measuring the same
+  // thing. The label reports the span actually covered, so a short history
+  // reads "60-day" rather than claiming a window it hasn't got.
+  function chartChange() {
     if (!series || series.length < 2) return null;
-    const last = series[series.length - 1];
-    const end = Date.parse(last.date);
-    if (!isFinite(end)) return null;
-    const target = end - days * DAY_MS;
-    let best = null;
-    let bestGap = Infinity;
-    for (const p of series) {
-      if (p === last) continue;
-      const gap = Math.abs(Date.parse(p.date) - target);
-      if (!isFinite(gap) || gap >= bestGap) continue;
-      bestGap = gap;
-      best = p;
-    }
-    // Report the span actually measured, not the one asked for: a short history
-    // or a weekend gap means the nearest point isn't where you aimed, and a
-    // "90-day" label over 60 days of data would just be wrong.
-    return changeAt(best, last);
+    return changeAt(series[0], series[series.length - 1]);
   }
 
-  // The change across whatever is selected on the chart. A range is measured
-  // end to end. A single day is measured against the point *before* it, since
-  // what you want from "the 14th" is what the 14th did, not the difference
-  // between the 14th and itself.
-  function changeSelected() {
+  // The most recent step in the series. With the series filled in from dated
+  // transactions this is usually literally yesterday to today; where a gap
+  // wouldn't reconcile it is further back, and changeAt() says so.
+  function lastChange() {
+    if (!series || series.length < 2) return null;
+    return changeAt(series[series.length - 2], series[series.length - 1]);
+  }
+
+  // The balance movement across the selection, measured as the transaction list
+  // reads the selection: both ends inclusive. So it runs from the point
+  // *before* the first selected day — what happened on that day is part of what
+  // was selected, and measuring from the day itself would leave it out.
+  function selectedChange() {
     if (!selFrom || !series || series.length < 2) return null;
     const i = indexOfDay(series, selFrom);
     const j = indexOfDay(series, selTo);
     if (i === null || j === null) return null;
-    const hi = Math.max(i, j);
-    const lo = Math.min(i, j) === hi ? hi - 1 : Math.min(i, j);
+    const lo = Math.min(i, j) - 1;
     // Nothing before the first point to measure the first point against.
     if (lo < 0) return null;
-    return changeAt(series[lo], series[hi]);
+    return changeAt(series[lo], series[Math.max(i, j)]);
   }
 
-  // Spell out what the figure was measured between, and how solid each end is.
-  // A "1-day" change that is really a week of one card's spending landing at
-  // once is exactly the sort of number that looks wrong with no way to check
-  // it — most of those are now filled in from the transactions, but a gap that
-  // wouldn't reconcile still carries, and it should say so rather than pass
-  // itself off as a day's worth.
-  function changeTitle(c) {
-    const bits = [`${c.from}  ${money(c.a.value)}  →  ${c.to}  ${money(c.b.value)}`];
-    for (const p of [c.a, c.b]) {
-      const day = dayKey(p.date);
-      if (p.live) bits.push(`${day} uses your live balances`);
-      if (p.derived) {
-        bits.push(`${p.derived} of ${p.of} balances on ${day} worked out from dated transactions`);
-      }
-      const carried = (p.of || 0) - (p.fresh || 0) - (p.derived || 0);
-      if (carried > 0) {
+  // What the listed transactions come to over a span of days.
+  //
+  // Netting is unaffected by the "− net payments" toggle: a pair is equal and
+  // opposite by definition, so removing both legs removes zero. The search box
+  // doesn't apply either — that is a way of finding a row, not a redefinition
+  // of what the days came to.
+  function txnNet(from, to) {
+    if (!txns) return null;
+    let sum = 0;
+    let n = 0;
+    for (const t of txns) {
+      if (!t.day || t.day < from || t.day > to) continue;
+      sum += t.amount;
+      n++;
+    }
+    return { sum, n };
+  }
+
+  // Why each end of a comparison is or isn't solid ground.
+  function pointNotes(p) {
+    const day = dayKey(p.date);
+    const out = [];
+    if (p.live) out.push(`${day} uses your live balances`);
+    if (p.derived) {
+      out.push(`${p.derived} of ${p.of} balances on ${day} worked out from dated transactions`);
+    }
+    const carried = (p.of || 0) - (p.fresh || 0) - (p.derived || 0);
+    if (carried > 0) {
+      out.push(
+        `${carried} of ${p.of} accounts hadn't reported by ${day} and couldn't be ` +
+          `reconciled from transactions — their last known balance is carried, so ` +
+          `anything they did lands on the day they next report`
+      );
+    }
+    return out;
+  }
+
+  function chartTitle(c) {
+    return [`The whole graph — ${c.from}  ${money(c.a.value)}  →  ${c.to}  ${money(c.b.value)}`]
+      .concat(pointNotes(c.a), pointNotes(c.b))
+      .join('\n');
+  }
+
+  // The day figure is the transactions', so its tooltip reconciles it against
+  // the balances. Where they disagree the difference is money that moved
+  // without a transaction to show for it, and naming it is the point: it is
+  // the one number here that no amount of care in this file can derive.
+  function spanTitle(bal, net, from, to) {
+    const when = from === to ? `on ${from}` : `from ${from} to ${to}`;
+    const bits = [];
+    if (net) {
+      bits.push(`${net.n} transaction${net.n === 1 ? '' : 's'} ${when}, netting ${signed(net.sum)}`);
+      const drift = Math.round((bal.delta - net.sum) * 100) / 100;
+      if (drift) {
         bits.push(
-          `${carried} of ${p.of} accounts hadn't reported by ${day} and couldn't ` +
-            `be reconciled from transactions — their last known balance is carried, ` +
-            `so anything they did lands on the day they next report`
+          `The balances moved ${signed(bal.delta)} over the same days. The ${signed(drift)} ` +
+            `difference isn't in the transaction list — interest, a fee, or a charge ` +
+            `that hasn't posted yet`
         );
       }
+    } else {
+      bits.push(`Balance movement ${when} — transactions not loaded`);
     }
-    return bits.join('\n');
+    bits.push(`${bal.from}  ${money(bal.a.value)}  →  ${bal.to}  ${money(bal.b.value)}`);
+    return bits.concat(pointNotes(bal.a), pointNotes(bal.b)).join('\n');
   }
 
-  function chgHtml(c, label, accent) {
-    if (!c) return '<span></span>';
+  function chgHtml(label, delta, title, accent) {
+    if (delta === null || delta === undefined || !isFinite(delta)) return '<span></span>';
     return (
-      `<span class="ecd-chg" title="${escapeHtml(changeTitle(c))}">` +
+      `<span class="ecd-chg" title="${escapeHtml(title)}">` +
       `<span class="ecd-chg-l">${escapeHtml(label)}</span> ` +
-      `<span class="ecd-chg-v" style="color:${c.delta < 0 ? accent.neg : accent.pos}">` +
-      `${signed(c.delta)}</span></span>`
+      `<span class="ecd-chg-v" style="color:${delta < 0 ? accent.neg : accent.pos}">` +
+      `${signed(delta)}</span></span>`
     );
   }
 
-  // Empower prints the window change bottom-left of the graph and the daily
-  // change bottom-right; ours says the same thing in the same places — except
-  // that the right-hand one follows the chart. Select days on the graph and it
-  // reports that span instead, because that is the question you asked by
-  // selecting them. The label names the dates rather than a span, so a
-  // selected change is never mistaken for the daily one.
+  // Empower prints a long-window change bottom-left of the graph and a daily
+  // one bottom-right; ours sits in the same corners and answers two different
+  // questions, each checkable against something on the screen.
+  //
+  // Left is the graph itself, end to end — read the first and last points off
+  // the picture and this is their difference.
+  //
+  // Right is what the *transactions* came to: for the last day by default, or
+  // for whatever is selected on the chart. That makes it the total of the rows
+  // listed underneath it in the detail view, which is the other thing on screen
+  // it could be checked against — and a change that doesn't match the list it
+  // sits above is a number you have to take on trust. Where the balances moved
+  // by something else, the tooltip says by how much and why that happens.
   function changeHtml(accent) {
-    const sel = changeSelected();
-    const long = changeOver(CHANGE_WINDOW);
-    const right = sel || changeOver(1);
-    const rightLabel = sel
+    const chart = chartChange();
+    const bal = selFrom ? selectedChange() : lastChange();
+    let out = chart ? chgHtml(`${chart.days}-day`, chart.delta, chartTitle(chart), accent) : '<span></span>';
+    if (!bal) return out + '<span></span>';
+
+    // The days whose transactions account for this change: the selection as the
+    // list reads it, or everything after the previous point up to the last.
+    const from = selFrom || shiftDay(bal.from, 1);
+    const to = selFrom ? selTo : bal.to;
+    const net = txnNet(from, to);
+    const label = selFrom
       ? selFrom === selTo
         ? selFrom
         : `${selFrom} → ${selTo}`
-      : right
-        ? `${right.days}-day`
-        : '';
-    return (
-      chgHtml(long, long ? `${long.days}-day` : '', accent) +
-      chgHtml(right, rightLabel, accent)
-    );
+      : `${bal.days}-day`;
+
+    return out + chgHtml(label, net ? net.sum : bal.delta, spanTitle(bal, net, from, to), accent);
   }
 
   // Cash over cards, stacked with the figures in their own right-aligned

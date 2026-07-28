@@ -23,17 +23,18 @@ function grab(name) {
 }
 
 const names = [
-  'seriesFrom', 'flattenHistory', 'accountTypeById', 'changeAt', 'changeOver',
-  'changeSelected', 'indexOfDay', 'dayKey', 'isLive', 'normalise',
+  'seriesFrom', 'flattenHistory', 'accountTypeById', 'changeAt', 'chartChange',
+  'lastChange', 'selectedChange', 'txnNet', 'indexOfDay', 'dayKey', 'isLive',
+  'normalise',
 ];
 
 const ctx = {
   DAY_MS: 86400000,
   ymd: (d) => new Date(d).toISOString().slice(0, 10),
   LIABILITIES: new Set(['CREDIT_CARD', 'LOAN', 'MORTGAGE']),
-  CHANGE_WINDOW: 90,
   rawAccounts: [],
   series: null,
+  txns: null,
   selFrom: null,
   selTo: null,
   Date, Set, Map, Number, String, Math, JSON, isFinite, Array, Object, console,
@@ -82,7 +83,7 @@ const spend = loaded([txn(CARD, '2026-07-22', -200), txn(CARD, '2026-07-25', -40
 
 const before = ctx.seriesFrom(hist(rows), null);
 ctx.series = before;
-eq('without transactions, the week lands on one day', ctx.changeOver(1).delta, -500);
+eq('without transactions, the week lands on one day', ctx.lastChange().delta, -500);
 eq('...and the 27th is flat all week', values(before).slice(1, 8).map((v) => v[1]),
   [3100, 3200, 3300, 3400, 3500, 3600, 3700]);
 
@@ -91,13 +92,14 @@ ctx.series = after;
 eq('spending lands on the days it happened', values(after),
   [['20', 3000], ['21', 3100], ['22', 3000], ['23', 3100], ['24', 3200],
    ['25', 2900], ['26', 3000], ['27', 3100], ['28', 3200]]);
-eq('the daily change is the bank alone', ctx.changeOver(1).delta, 100);
+eq('the daily change is the bank alone', ctx.lastChange().delta, 100);
 // −200 of card against +100 of bank on the same day.
 eq('the 22nd shows the purchase', after[2].value - after[1].value, -100);
 eq('nothing is carried on a derived day', after[3].fresh + after[3].derived, after[3].of);
 eq('derived days are counted as derived', [after[3].fresh, after[3].derived], [1, 1]);
-eq('the 90-day total is unchanged by all this',
-  ctx.changeOver(90).delta, after[8].value - after[0].value);
+eq('the long figure is the graph end to end',
+  ctx.chartChange().delta, after[8].value - after[0].value);
+eq('...and reports the span it covers', ctx.chartChange().days, 8);
 
 // ---------------------------------------------------------------------------
 section('a gap the transactions do not account for');
@@ -214,30 +216,87 @@ section('selection-driven change');
 noToday();
 ctx.series = ctx.seriesFrom(hist(rows), spend);
 ctx.selFrom = ctx.selTo = null;
-eq('no selection, no figure', ctx.changeSelected(), null);
+eq('no selection, no figure', ctx.selectedChange(), null);
 
+// Both ends inclusive, as the transaction list reads a selection — so the
+// measurement starts at the point *before* the first selected day, and what
+// happened on that day counts as part of it.
 ctx.selFrom = '2026-07-22';
 ctx.selTo = '2026-07-26';
-const range = ctx.changeSelected();
-eq('range measured end to end', range.delta, 3000 - 3000);
-eq('range span', range.days, 4);
-eq('range endpoints', [range.from, range.to], ['2026-07-22', '2026-07-26']);
+const range = ctx.selectedChange();
+eq('a range includes its first day', [range.from, range.to], ['2026-07-21', '2026-07-26']);
+eq('range delta', range.delta, 3000 - 3100);
 
 ctx.selFrom = ctx.selTo = '2026-07-25';
-const one = ctx.changeSelected();
+const one = ctx.selectedChange();
 eq('a single day is measured against the day before', one.delta, 2900 - 3200);
 eq('single day span', one.days, 1);
 eq('single day endpoints', [one.from, one.to], ['2026-07-24', '2026-07-25']);
 
 ctx.selFrom = ctx.selTo = '2026-07-20';
-eq('the first point has nothing to measure against', ctx.changeSelected(), null);
-
-ctx.selFrom = '2026-07-20';
-ctx.selTo = '2026-07-28';
-eq('a selected span reports its own length', ctx.changeSelected().days, 8);
+eq('the first point has nothing to measure against', ctx.selectedChange(), null);
 
 ctx.selFrom = ctx.selTo = '2026-08-05';
-eq('an out-of-range selection clamps to the last point', ctx.changeSelected().to, '2026-07-28');
+eq('an out-of-range selection clamps to the last point', ctx.selectedChange().to, '2026-07-28');
+
+// ---------------------------------------------------------------------------
+section('the day figure is the net of that day\'s transactions');
+ctx.txns = loaded([
+  txn(CARD, '2026-07-22', -200),
+  txn(CARD, '2026-07-25', -400),
+  txn(BANK, '2026-07-25', 250),
+]);
+eq('a day nets its own transactions', ctx.txnNet('2026-07-25', '2026-07-25'), { sum: -150, n: 2 });
+eq('a range nets everything inside it, both ends included',
+  ctx.txnNet('2026-07-22', '2026-07-25'), { sum: -350, n: 3 });
+eq('a day with nothing on it nets zero', ctx.txnNet('2026-07-23', '2026-07-23'), { sum: 0, n: 0 });
+ctx.txns = null;
+eq('not loaded is not the same as zero', ctx.txnNet('2026-07-25', '2026-07-25'), null);
+
+// ---------------------------------------------------------------------------
+section('the figure and the graph agree where transactions explain the movement');
+// Both accounts report daily and every movement has a transaction behind it:
+// a −200 card purchase on the 21st, a −300 one on the 22nd, and a 500 card
+// payment clearing both legs on the 23rd.
+noToday();
+const dailyRows = [
+  [BANK, '2026-07-20', 5000], [BANK, '2026-07-21', 4800], [BANK, '2026-07-22', 4800],
+  [BANK, '2026-07-23', 4300], [BANK, '2026-07-24', 4300],
+  [CARD, '2026-07-20', 1000], [CARD, '2026-07-21', 1000], [CARD, '2026-07-22', 1300],
+  [CARD, '2026-07-23', 800], [CARD, '2026-07-24', 800],
+];
+const dailyTxns = loaded([
+  txn(BANK, '2026-07-21', -200),
+  txn(CARD, '2026-07-22', -300),
+  txn(BANK, '2026-07-23', -500),
+  txn(CARD, '2026-07-23', 500),
+]);
+ctx.series = ctx.seriesFrom(hist(dailyRows), dailyTxns);
+ctx.txns = dailyTxns;
+eq('net cash by day', values(ctx.series),
+  [['20', 4000], ['21', 3800], ['22', 3500], ['23', 3500], ['24', 3500]]);
+
+for (const day of ['2026-07-21', '2026-07-22', '2026-07-23', '2026-07-24']) {
+  ctx.selFrom = ctx.selTo = day;
+  const bal = ctx.selectedChange();
+  eq(`${day}: the figure matches the balance movement`,
+    ctx.txnNet(day, day).sum, bal.delta);
+}
+
+ctx.selFrom = '2026-07-21';
+ctx.selTo = '2026-07-23';
+eq('a range matches too', ctx.txnNet('2026-07-21', '2026-07-23').sum, ctx.selectedChange().delta);
+eq('...and it is the whole three days', ctx.selectedChange().delta, 3500 - 4000);
+
+// A card payment nets to zero without vanishing from the count: both legs are
+// listed, and the toggle that hides them removes an equal and opposite pair.
+eq('the payment day nets zero across both its legs',
+  ctx.txnNet('2026-07-23', '2026-07-23'), { sum: 0, n: 2 });
+
+ctx.selFrom = ctx.selTo = null;
+eq('with nothing selected the figure is the last step', ctx.lastChange().delta, 0);
+eq('the graph end to end', ctx.chartChange().delta, 3500 - 4000);
+eq('...over the days it actually spans', ctx.chartChange().days, 4);
 
 Date.now = realNow;
 console.log(fails ? `\n${fails} FAILED` : '\nall passed');

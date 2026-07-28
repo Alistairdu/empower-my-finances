@@ -111,25 +111,40 @@ Below the title, **cash and cards are stacked** rather than run together on one
 line, with the figures in their own right-aligned column so the digits line up
 and the gap between them is readable without doing the subtraction yourself.
 
-Under the graph, the **change over each window** sits at the two bottom corners
-exactly as Empower's does: roughly 90-day on the left, 1-day on the right, red
-below zero and green above. Each is measured against the history point *nearest*
-that many days back, never an index offset — the series has gaps (weekends, a
-missed sync) and counting rows would slide the window onto the wrong dates. The
-label reports the span actually measured, so a short history reads "60-day"
-instead of claiming 90.
+Under the graph, a **change figure** sits at each bottom corner exactly as
+Empower's does — red below zero, green above. They answer two different
+questions, and each can be checked against something else on the screen.
 
-**The right-hand figure follows the chart.** With nothing selected it is the
-daily change, as above. Select days on the graph — click one, drag a span, or
-walk it with the arrow keys — and it reports the change across *that* span
-instead, which is the question you asked by selecting them. The label switches
-from a span (`1-day`) to the dates themselves (`2026-07-14`, or `2026-07-01 →
-2026-07-14`), so a selected change can't be misread as the daily one. A single
-selected day is measured against the point *before* it: what you want from "the
-14th" is what the 14th did, not the difference between the 14th and itself. The
-left-hand 90-day figure stays put, so the long view is still there to compare
-against. Only that one number is repainted when the selection moves — rebuilding
-the view would tear the search box out mid-keystroke.
+**Left is the graph itself, end to end.** Read the first and last points off the
+picture and this is their difference. Not a fixed 90-day window: the graph draws
+`SPARK_DAYS` (180) of history, so a 90-day figure under a 180-day picture is a
+number you can't check against what you're looking at, and the two won't agree
+because they aren't measuring the same thing. The label reports the span
+actually covered, so a short history reads "60-day" rather than claiming a
+window it hasn't got.
+
+**Right is what the transactions came to** — for the last day by default, or for
+whatever is selected on the chart. Click a day, drag a span, or walk it with the
+arrow keys, and the figure follows. The label switches from a span (`1-day`) to
+the dates themselves (`2026-07-14`, or `2026-07-01 → 2026-07-14`), so a selected
+change can't be misread as the daily one. Only this number is repainted when the
+selection moves — rebuilding the view would tear the search box out mid-keystroke.
+
+Being the transactions' total is what makes it checkable: in the detail view it
+is the sum of the rows listed directly underneath it, and a change that doesn't
+match the list it sits above is a number you have to take on trust. The
+selection is read the way the list reads it — **both ends inclusive** — so the
+measurement starts at the point *before* the first selected day, and what
+happened on that day counts as part of it. Netting is unaffected by the
+`− net payments` toggle, since a pair is equal and opposite by definition and
+removing both legs removes zero. The search box doesn't apply either: it is a
+way of finding a row, not a redefinition of what the days came to.
+
+One consequence worth knowing: **a day whose transactions haven't posted yet
+reads as zero**, because that is what the list says too. Hovering gives the
+balance movement over the same days and names the difference — interest, a fee,
+or a charge still pending. That difference is the one number here that no amount
+of care in this file can derive, so it is reported rather than absorbed.
 
 Hovering either figure shows what it was measured between: both dates, both
 totals, and any reason the two ends aren't strictly comparable (see below).
@@ -300,8 +315,8 @@ falls back to the nearest one.
 
 The day filter stacks with the search and the transfer toggle: all three apply
 at once, in `visibleTxns()`. The change figure at the bottom-right of the graph
-follows the selection as well, so a selected span tells you both what moved and
-what you spent over it.
+follows the selection as well, and is the net of exactly the rows the selection
+puts in the list.
 
 ### Filtering the transaction list
 
