@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Empower — My Numbers",
+  "version": "0.18.0",
+  "description": "Adds a floating panel to the Empower Personal Dashboard with custom computed figures (Net Cash = banks minus credit cards, etc).",
+  "host_permissions": [
+    "https://*.personalcapital.com/*",
+    "https://*.empower.com/*",
+    "https://*.empower-retirement.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.personalcapital.com/*",
+        "https://*.empower.com/*",
+        "https://*.empower-retirement.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://*.personalcapital.com/*",
+        "https://*.empower.com/*",
+        "https://*.empower-retirement.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+# Packaged extension
+*.zip
+*.crx
+*.pem
+
+# Local tool settings
+.claude/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
