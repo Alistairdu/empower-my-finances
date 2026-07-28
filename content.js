@@ -453,13 +453,84 @@
     const carry = new Map();
     const out = [];
     for (const day of [...days].sort()) {
-      for (const [id, m] of perAcct) if (m.has(day)) carry.set(id, m.get(day));
+      // How many accounts actually reported on this day, as against how many
+      // are being carried. Carrying is what keeps the total comparable across
+      // a gap, but it moves an account's whole gap into the day it resumes on:
+      // a card silent for a week posts seven days of spending as one step. The
+      // step is real money, it just isn't one day's worth — so record what the
+      // day was built from and let the change figure say so.
+      let fresh = 0;
+      for (const [id, m] of perAcct) {
+        if (!m.has(day)) continue;
+        carry.set(id, m.get(day));
+        fresh++;
+      }
       if (day < start) continue;
       let sum = 0;
       for (const v of carry.values()) sum += v;
-      out.push({ date: day, value: sum });
+      out.push({ date: day, value: sum, fresh, of: perAcct.size });
     }
+    // The accounts this series is a total of, so anything anchoring to it later
+    // can sum the same set rather than a different one.
+    out.ids = new Set(perAcct.keys());
     return out;
+  }
+
+  // The card's headline comes from the accounts payload; the graph comes from
+  // getHistories. They are different endpoints and they do not land together —
+  // history routinely stops at yesterday, or carries a row for today from a
+  // balance taken before this morning's sync. Left alone, the graph ends
+  // somewhere other than the figure printed directly above it, and the "1-day"
+  // change compares two history days while the headline has already moved on:
+  // right about the series, wrong about the question being asked of it.
+  //
+  // So the series is anchored to the live total before anything draws it. The
+  // anchor sums *only the accounts the history summed*, for exactly the reason
+  // seriesFrom carries balances forward — a total over a different set of
+  // accounts is a different figure, not a fresher one. If any of them is
+  // missing from the live payload there is no comparable total to anchor with,
+  // and the history is left to speak for itself.
+  function liveTotal() {
+    if (!series || !series.ids || !series.ids.size || !rawAccounts.length) return null;
+    let sum = 0;
+    let seen = 0;
+    for (const a of rawAccounts) {
+      if (!isLive(a)) continue;
+      const id = String(a.userAccountId ?? a.accountId ?? a.id);
+      if (!series.ids.has(id)) continue;
+      const v = normalise(a);
+      if (!isFinite(v)) return null;
+      // normalise() hands back liabilities as a positive amount owed; the
+      // series signs them the other way. Going through it anyway keeps the
+      // sign fix in one place, as the README promises.
+      sum += a.productType === 'CREDIT_CARD' ? -v : v;
+      seen++;
+    }
+    return seen === series.ids.size ? sum : null;
+  }
+
+  function anchorSeries() {
+    if (!series || !series.length) return;
+    const v = liveTotal();
+    if (v === null) return;
+    const today = ymd(Date.now());
+    const last = series[series.length - 1];
+    const lastDay = dayKey(last.date);
+    // History dated ahead of the clock is not something to argue with.
+    if (!lastDay || lastDay > today) return;
+    if (lastDay === today) {
+      last.value = v;
+      last.fresh = series.ids.size;
+      last.live = true;
+    } else {
+      series.push({
+        date: today,
+        value: v,
+        fresh: series.ids.size,
+        of: series.ids.size,
+        live: true,
+      });
+    }
   }
 
   // Parameter names have changed across Empower builds; try the known spellings
@@ -1281,6 +1352,20 @@
   // before the last one rather than an index offset back: the history has gaps
   // (weekends, a missed sync), and counting rows would quietly slide the
   // window to the wrong dates.
+  // The long window printed bottom-left, matching the one Empower shows.
+  const CHANGE_WINDOW = 90;
+
+  // What moved between two points of the series, carrying enough of both ends
+  // to say honestly what was compared.
+  function changeAt(a, b) {
+    if (!a || !b) return null;
+    const from = dayKey(a.date);
+    const to = dayKey(b.date);
+    const span = Math.round((Date.parse(to) - Date.parse(from)) / DAY_MS);
+    if (!from || !to || !isFinite(span) || span < 1) return null;
+    return { delta: b.value - a.value, days: span, from, to, a, b };
+  }
+
   function changeOver(days) {
     if (!series || series.length < 2) return null;
     const last = series[series.length - 1];
@@ -1296,29 +1381,79 @@
       bestGap = gap;
       best = p;
     }
-    if (!best) return null;
     // Report the span actually measured, not the one asked for: a short history
     // or a weekend gap means the nearest point isn't where you aimed, and a
     // "90-day" label over 60 days of data would just be wrong.
-    return {
-      delta: last.value - best.value,
-      days: Math.max(1, Math.round((end - Date.parse(best.date)) / DAY_MS)),
-    };
+    return changeAt(best, last);
+  }
+
+  // The change across whatever is selected on the chart. A range is measured
+  // end to end. A single day is measured against the point *before* it, since
+  // what you want from "the 14th" is what the 14th did, not the difference
+  // between the 14th and itself.
+  function changeSelected() {
+    if (!selFrom || !series || series.length < 2) return null;
+    const i = indexOfDay(series, selFrom);
+    const j = indexOfDay(series, selTo);
+    if (i === null || j === null) return null;
+    const hi = Math.max(i, j);
+    const lo = Math.min(i, j) === hi ? hi - 1 : Math.min(i, j);
+    // Nothing before the first point to measure the first point against.
+    if (lo < 0) return null;
+    return changeAt(series[lo], series[hi]);
+  }
+
+  // Spell out what the figure was measured between. A "1-day" change that is
+  // really a week of one card's spending landing at once is exactly the sort
+  // of number that looks wrong with no way to check it.
+  function changeTitle(c) {
+    const bits = [`${c.from}  ${money(c.a.value)}  →  ${c.to}  ${money(c.b.value)}`];
+    for (const p of [c.a, c.b]) {
+      const day = dayKey(p.date);
+      if (p.live) {
+        bits.push(`${day} is your live balance, not a history point`);
+      } else if (p.of && p.fresh < p.of) {
+        bits.push(
+          `${p.fresh} of ${p.of} accounts reported on ${day} — the rest carry ` +
+            `their last known balance, so anything they did lands on the day ` +
+            `they next report`
+        );
+      }
+    }
+    return bits.join('\n');
+  }
+
+  function chgHtml(c, label, accent) {
+    if (!c) return '<span></span>';
+    return (
+      `<span class="ecd-chg" title="${escapeHtml(changeTitle(c))}">` +
+      `<span class="ecd-chg-l">${escapeHtml(label)}</span> ` +
+      `<span class="ecd-chg-v" style="color:${c.delta < 0 ? accent.neg : accent.pos}">` +
+      `${signed(c.delta)}</span></span>`
+    );
   }
 
   // Empower prints the window change bottom-left of the graph and the daily
-  // change bottom-right; ours says the same thing in the same places.
+  // change bottom-right; ours says the same thing in the same places — except
+  // that the right-hand one follows the chart. Select days on the graph and it
+  // reports that span instead, because that is the question you asked by
+  // selecting them. The label names the dates rather than a span, so a
+  // selected change is never mistaken for the daily one.
   function changeHtml(accent) {
-    return [changeOver(90), changeOver(1)]
-      .map((c) => {
-        if (!c) return '<span></span>';
-        return (
-          `<span class="ecd-chg"><span class="ecd-chg-l">${c.days}-day</span> ` +
-          `<span class="ecd-chg-v" style="color:${c.delta < 0 ? accent.neg : accent.pos}">` +
-          `${signed(c.delta)}</span></span>`
-        );
-      })
-      .join('');
+    const sel = changeSelected();
+    const long = changeOver(CHANGE_WINDOW);
+    const right = sel || changeOver(1);
+    const rightLabel = sel
+      ? selFrom === selTo
+        ? selFrom
+        : `${selFrom} → ${selTo}`
+      : right
+        ? `${right.days}-day`
+        : '';
+    return (
+      chgHtml(long, long ? `${long.days}-day` : '', accent) +
+      chgHtml(right, rightLabel, accent)
+    );
   }
 
   // Cash over cards, stacked with the figures in their own right-aligned
@@ -1361,7 +1496,10 @@
         const h = sparkHeight(card, spark);
         // paintCard runs on every sweep; only redraw when something actually
         // changed, otherwise the graph flickers a few times a second.
-        const key = `${series.length}:${h}:${net < 0}`;
+        // The last value is in the key as well as the length: anchoring the
+        // series to the live total rewrites today's point in place, and a key
+        // of length alone would leave the old shape on screen.
+        const key = `${series.length}:${series[series.length - 1].value}:${h}:${net < 0}`;
         if (spark.dataset.ecdKey !== key) {
           spark.dataset.ecdKey = key;
           spark.style.height = h + 'px';
@@ -1412,6 +1550,7 @@
     seriesTriedAt = Date.now();
     try {
       series = await fetchSeries(SPARK_DAYS);
+      anchorSeries();
       seriesError = null;
       const c = document.getElementById(CARD_ID);
       if (c) paintCard(c);
@@ -1435,6 +1574,9 @@
       lastData = group(accounts);
       lastData.source = source;
       lastData.at = at;
+      // Accounts normally arrive before the history, but a refresh can land
+      // the other way round. Anchoring is idempotent, so run it either way.
+      anchorSeries();
       const c = document.getElementById(CARD_ID);
       if (c) paintCard(c);
     } catch (_) {
@@ -1473,6 +1615,7 @@
     selFrom = from;
     selTo = to;
     refreshRows();
+    refreshChange();
   }
 
   function clearSelection() {
@@ -1736,6 +1879,16 @@
       btn.setAttribute('aria-pressed', String(hidePaired));
       btn.classList.toggle('ecd-on', hidePaired);
     }
+  }
+
+  // The right-hand change figure tracks the selection, so it is repainted
+  // alongside the rows — and only it. Re-rendering the view to move one number
+  // would tear the search box out mid-keystroke and take the focus with it.
+  function refreshChange() {
+    if (!detailEl) return;
+    const foot = detailEl.querySelector('.ecd-d-foot');
+    if (!foot) return;
+    foot.innerHTML = series && series.length > 1 ? changeHtml(accentFor(detailEl)) : '';
   }
 
   function pairedCount() {
@@ -2085,6 +2238,9 @@
   #ecd-card .ecd-c-foot,#ecd-detail .ecd-d-foot{display:flex;
     justify-content:space-between;align-items:baseline;margin-top:6px;
     font:400 12px/1.3 inherit;font-variant-numeric:tabular-nums}
+  /* A selected span is labelled with its dates, which is wider than "1-day" —
+     it may not wrap into two lines and drag the corner out of alignment. */
+  #ecd-card .ecd-chg,#ecd-detail .ecd-chg{white-space:nowrap}
   #ecd-card .ecd-chg-l,#ecd-detail .ecd-chg-l{opacity:.6}
   #ecd-card .ecd-chg-v,#ecd-detail .ecd-chg-v{font-weight:700}
   /* Height is set inline from the measured card; these rules only stop

@@ -119,6 +119,48 @@ missed sync) and counting rows would slide the window onto the wrong dates. The
 label reports the span actually measured, so a short history reads "60-day"
 instead of claiming 90.
 
+**The right-hand figure follows the chart.** With nothing selected it is the
+daily change, as above. Select days on the graph — click one, drag a span, or
+walk it with the arrow keys — and it reports the change across *that* span
+instead, which is the question you asked by selecting them. The label switches
+from a span (`1-day`) to the dates themselves (`2026-07-14`, or `2026-07-01 →
+2026-07-14`), so a selected change can't be misread as the daily one. A single
+selected day is measured against the point *before* it: what you want from "the
+14th" is what the 14th did, not the difference between the 14th and itself. The
+left-hand 90-day figure stays put, so the long view is still there to compare
+against. Only that one number is repainted when the selection moves — rebuilding
+the view would tear the search box out mid-keystroke.
+
+Hovering either figure shows what it was measured between: both dates, both
+totals, and any reason the two ends aren't strictly comparable (see below).
+
+### Why the daily change used to read wrong
+
+Two things made it so, and both are now handled.
+
+**The graph ended somewhere other than the number printed above it.** The
+headline figure comes from the accounts payload; the graph comes from
+`getHistories`. They are different endpoints and they don't land together —
+history routinely stops at yesterday, or carries a row for today taken before
+this morning's sync. So the "1-day" change compared two history days while the
+headline had already moved on: right about the series, wrong about the question.
+The series is now **anchored to the live total** before anything draws it —
+today's point is rewritten from your current balances, or appended if history
+hasn't reached today. The anchor sums *only the accounts the history summed*,
+for the same reason `seriesFrom` carries balances forward: a total over a
+different set of accounts is a different figure, not a fresher one. If any of
+them is missing from the live payload, there is no comparable total and the
+history is left to speak for itself.
+
+**Carrying a balance forward moves an account's whole gap onto one day.** It is
+what keeps the total comparable across a reporting gap, but the flip side is
+that a card silent for a week posts seven days of spending as a single step. The
+money is real; it just isn't one day's worth. Each point now records how many
+accounts actually reported that day against how many are being carried, and the
+hover text says so — `3 of 5 accounts reported on 2026-07-27 — the rest carry
+their last known balance`. A step that looks too big now explains itself instead
+of just looking wrong.
+
 The graph is measured to fill whatever height the card has left, after the
 header, the breakdown and the change row have taken theirs.
 
@@ -190,7 +232,9 @@ need not agree on format — and a selected day with no matching history point
 falls back to the nearest one.
 
 The day filter stacks with the search and the transfer toggle: all three apply
-at once, in `visibleTxns()`.
+at once, in `visibleTxns()`. The change figure at the bottom-right of the graph
+follows the selection as well, so a selected span tells you both what moved and
+what you spent over it.
 
 ### Filtering the transaction list
 
@@ -275,6 +319,10 @@ value forward across its gaps, and starts the series only once every account has
 reported at least once. Before that point there is no honest total to draw, so
 none is drawn — which is why the change label reports the span it actually
 measured rather than assuming 90 days are available.
+
+`anchorSeries()` then pins the last point to your live balances, so the graph
+ends on the figure printed above it. Both of these are why the daily change is
+what it is; see "Why the daily change used to read wrong" above.
 
 ## Hiding Empower's own cards
 
