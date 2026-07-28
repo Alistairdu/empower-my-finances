@@ -420,13 +420,34 @@
   // day. That is a reporting gap being drawn as a spike — and it corrupts any
   // comparison between two dates, which is exactly what the 90-day figure is.
   //
-  // So: carry each account's last known balance forward over its gaps, and
-  // start the series only where every account has reported at least once.
-  // Before that point there is no honest total to draw.
-  function seriesFrom(json) {
+  // Each account's balance for a given day therefore comes from one of three
+  // places, in order of authority:
+  //
+  //   1. what the account reported that day — including a live balance from
+  //      the accounts payload, which is a reading for today like any other and
+  //      a fresher one than history's
+  //   2. what the dated transactions say it must have been, across a gap whose
+  //      two ends both reported and whose transactions add up to the difference
+  //   3. its last known balance, carried
+  //
+  // (2) is why transactions are loaded for the graph and not just the detail
+  // view. Carrying forward keeps the total comparable across a reporting gap,
+  // but it moves the account's whole gap onto the day it resumes: a card silent
+  // for a week posts seven days of spending as a single step, and the daily
+  // change reads that step as one day's worth. We know when the money actually
+  // moved — the transactions are dated — so where those dated movements account
+  // for the gap exactly, they walk the balance across it day by day instead.
+  //
+  // "Exactly" is the safeguard, and it is the whole of it. A gap is only filled
+  // when its transactions reconcile to the cent against the balances at both
+  // ends. A pending charge, an interest posting, a transaction window that
+  // doesn't reach back far enough — any of them and the sums won't meet, which
+  // means the gap isn't understood, and it carries forward as before rather
+  // than being filled with something plausible-looking.
+  function seriesFrom(json, movements) {
     const typeById = accountTypeById();
     const perAcct = new Map(); // id → Map(day → signed balance)
-    const days = new Set();
+    const reported = new Set(); // days some account actually reported on
 
     for (const h of flattenHistory(json && json.spData)) {
       const type = typeById.get(String(h.id));
@@ -438,9 +459,41 @@
       const id = String(h.id);
       if (!perAcct.has(id)) perAcct.set(id, new Map());
       perAcct.get(id).set(day, type === 'CREDIT_CARD' ? -Math.abs(h.balance) : h.balance);
-      days.add(day);
+      reported.add(day);
     }
     if (!perAcct.size) return [];
+
+    // A live balance is a reading for today, and a better one than history's:
+    // the accounts payload is current, where history stops at yesterday or
+    // carries today's row from a balance taken before this morning's sync.
+    // It also gives each account a closing balance to reconcile its most
+    // recent gap against, which history alone never provides for the days
+    // since it last spoke. Per account rather than as one total, so an account
+    // missing from the payload costs only its own reading.
+    const today = ymd(Date.now());
+    const live = new Set();
+    for (const a of rawAccounts) {
+      if (!isLive(a)) continue;
+      const id = String(a.userAccountId ?? a.accountId ?? a.id);
+      const m = perAcct.get(id);
+      if (!m) continue;
+      // normalise() defaults a missing balance to 0, which is a real figure and
+      // a badly wrong one — a card with no balance field would read as paid off.
+      // Only take a reading from an account that actually carries one.
+      const raw = a.balance ?? a.currentBalance;
+      if (raw === null || raw === undefined || !isFinite(Number(raw))) continue;
+      const v = normalise(a);
+      let latest = '';
+      for (const d of m.keys()) if (d > latest) latest = d;
+      // History dated ahead of the clock is not something to argue with.
+      if (latest > today) continue;
+      // normalise() hands liabilities back as a positive amount owed; the
+      // series signs them the other way. Going through it anyway keeps the
+      // sign fix in one place, as the README promises.
+      m.set(today, a.productType === 'CREDIT_CARD' ? -v : v);
+      live.add(id);
+      reported.add(today);
+    }
 
     // The series can only start once every account has a balance to carry.
     let start = '';
@@ -450,87 +503,99 @@
       if (first > start) start = first;
     }
 
+    // Movements per account per day. The series signs a card as a negative
+    // amount owed and transaction amounts are already signed money-in/money-out,
+    // so the two agree without conversion: a $100 card purchase is −100 to
+    // both the balance and the total, and a $500 card payment is +500 to both.
+    //
+    // Not having the transactions yet is a different thing from an account
+    // having none, and the difference matters: a gap whose balance happens to
+    // end where it started reconciles against an empty list trivially, and
+    // would be drawn as a flat stretch on no evidence at all. Derive only from
+    // a list we actually hold, and only back as far as it was asked to cover —
+    // before that, "no transactions" means "none loaded", not "none happened".
+    const haveTxns = Array.isArray(movements);
+    const txnFrom = (movements && movements.from) || '';
+    const moved = new Map(); // id → Map(day → summed amount)
+    for (const t of movements || []) {
+      if (!t || !t.day || !isFinite(t.amount) || !perAcct.has(t.acctId)) continue;
+      if (!moved.has(t.acctId)) moved.set(t.acctId, new Map());
+      const m = moved.get(t.acctId);
+      m.set(t.day, (m.get(t.day) || 0) + t.amount);
+    }
+
+    const cents = (n) => Math.round(n * 100);
+    const nextDay = (d) => ymd(Date.parse(d) + DAY_MS);
+    const known = new Map(); // id → Map(day → value)
+    const derived = new Map(); // id → Set(day) worked out rather than reported
+
+    for (const [id, m] of perAcct) {
+      const vals = new Map(m);
+      const from = new Set();
+      const mv = moved.get(id) || new Map();
+      const said = [...m.keys()].sort();
+
+      for (let k = 0; haveTxns && k + 1 < said.length; k++) {
+        const a = said[k];
+        const b = said[k + 1];
+        if (a < txnFrom) continue;
+
+        let total = 0;
+        for (const [d, amt] of mv) if (d > a && d <= b) total += amt;
+        // Doesn't add up: the gap isn't understood, so leave it to be carried.
+        if (cents(total) !== cents(m.get(b) - m.get(a))) continue;
+
+        // Every calendar day between the two readings, not just the ones a
+        // transaction is dated on. Inside a gap that reconciles, the balance on
+        // each day is known exactly: it is the earlier reading plus whatever is
+        // dated on or before that day, and the later reading proves the sum.
+        // The quiet days in between are the flat stretches of the graph, and
+        // they are as known as the days money moved.
+        let v = m.get(a);
+        for (let d = nextDay(a); d < b; d = nextDay(d)) {
+          v += mv.get(d) || 0;
+          vals.set(d, v);
+          from.add(d);
+        }
+      }
+      known.set(id, vals);
+      derived.set(id, from);
+    }
+
+    // A day is worth drawing if anyone reported on it or anyone can be shown to
+    // have been at a particular balance on it. A day where every account is
+    // merely carrying holds no information, and drawing a point for it implies
+    // a daily resolution the data doesn't have.
+    const days = new Set(reported);
+    for (const from of derived.values()) for (const d of from) days.add(d);
+
     const carry = new Map();
     const out = [];
     for (const day of [...days].sort()) {
-      // How many accounts actually reported on this day, as against how many
-      // are being carried. Carrying is what keeps the total comparable across
-      // a gap, but it moves an account's whole gap into the day it resumes on:
-      // a card silent for a week posts seven days of spending as one step. The
-      // step is real money, it just isn't one day's worth — so record what the
-      // day was built from and let the change figure say so.
+      // How the day was arrived at, per account, so the change figure can say
+      // what it is really comparing.
       let fresh = 0;
-      for (const [id, m] of perAcct) {
-        if (!m.has(day)) continue;
-        carry.set(id, m.get(day));
-        fresh++;
+      let worked = 0;
+      for (const [id, vals] of known) {
+        if (!vals.has(day)) continue;
+        carry.set(id, vals.get(day));
+        if (derived.get(id).has(day)) worked++;
+        else fresh++;
       }
+      // Days before the start still build up `carry`; they just aren't drawn.
       if (day < start) continue;
       let sum = 0;
       for (const v of carry.values()) sum += v;
-      out.push({ date: day, value: sum, fresh, of: perAcct.size });
-    }
-    // The accounts this series is a total of, so anything anchoring to it later
-    // can sum the same set rather than a different one.
-    out.ids = new Set(perAcct.keys());
-    return out;
-  }
-
-  // The card's headline comes from the accounts payload; the graph comes from
-  // getHistories. They are different endpoints and they do not land together —
-  // history routinely stops at yesterday, or carries a row for today from a
-  // balance taken before this morning's sync. Left alone, the graph ends
-  // somewhere other than the figure printed directly above it, and the "1-day"
-  // change compares two history days while the headline has already moved on:
-  // right about the series, wrong about the question being asked of it.
-  //
-  // So the series is anchored to the live total before anything draws it. The
-  // anchor sums *only the accounts the history summed*, for exactly the reason
-  // seriesFrom carries balances forward — a total over a different set of
-  // accounts is a different figure, not a fresher one. If any of them is
-  // missing from the live payload there is no comparable total to anchor with,
-  // and the history is left to speak for itself.
-  function liveTotal() {
-    if (!series || !series.ids || !series.ids.size || !rawAccounts.length) return null;
-    let sum = 0;
-    let seen = 0;
-    for (const a of rawAccounts) {
-      if (!isLive(a)) continue;
-      const id = String(a.userAccountId ?? a.accountId ?? a.id);
-      if (!series.ids.has(id)) continue;
-      const v = normalise(a);
-      if (!isFinite(v)) return null;
-      // normalise() hands back liabilities as a positive amount owed; the
-      // series signs them the other way. Going through it anyway keeps the
-      // sign fix in one place, as the README promises.
-      sum += a.productType === 'CREDIT_CARD' ? -v : v;
-      seen++;
-    }
-    return seen === series.ids.size ? sum : null;
-  }
-
-  function anchorSeries() {
-    if (!series || !series.length) return;
-    const v = liveTotal();
-    if (v === null) return;
-    const today = ymd(Date.now());
-    const last = series[series.length - 1];
-    const lastDay = dayKey(last.date);
-    // History dated ahead of the clock is not something to argue with.
-    if (!lastDay || lastDay > today) return;
-    if (lastDay === today) {
-      last.value = v;
-      last.fresh = series.ids.size;
-      last.live = true;
-    } else {
-      series.push({
-        date: today,
-        value: v,
-        fresh: series.ids.size,
-        of: series.ids.size,
-        live: true,
+      out.push({
+        date: day,
+        value: sum,
+        fresh,
+        derived: worked,
+        of: perAcct.size,
+        live: day === today && live.size > 0,
       });
     }
+    return out;
   }
 
   // Parameter names have changed across Empower builds; try the known spellings
@@ -564,7 +629,7 @@
       try {
         const json = await apiPost('/api/account/getHistories', HISTORY_VARIANTS[i](ids, s0, e0));
         const sp = (json && json.spData) || {};
-        const s = seriesFrom(json);
+        const s = seriesFrom(json, txns);
         probes.push({
           variant: i,
           spDataKeys: Object.keys(sp),
@@ -575,6 +640,10 @@
         });
         if (s.length) {
           historyProbe = probes;
+          // Kept so the series can be rebuilt in place when its other two
+          // inputs — the live balances and the transactions — arrive or move
+          // on, without paying for the call again.
+          historyJson = json;
           return s;
         }
       } catch (e) {
@@ -593,8 +662,9 @@
   async function fetchTransactions(days) {
     const ids = cashAccountIds();
     if (!ids.length) throw new Error('no cash or credit card accounts found');
+    const from = ymd(Date.now() - days * DAY_MS);
     const json = await apiPost('/api/transaction/getUserTransactions', {
-      startDate: ymd(Date.now() - days * DAY_MS),
+      startDate: from,
       endDate: ymd(Date.now()),
       userAccountIds: JSON.stringify(ids),
     });
@@ -623,6 +693,9 @@
       })
       .filter((t) => t.date && isFinite(t.amount))
       .sort((a, b) => (a.date < b.date ? 1 : -1));
+    // The window asked for, so the series knows how far back the *absence* of
+    // a transaction is evidence of anything.
+    out.from = from;
     markPairs(out);
     return out;
   }
@@ -1403,20 +1476,26 @@
     return changeAt(series[lo], series[hi]);
   }
 
-  // Spell out what the figure was measured between. A "1-day" change that is
-  // really a week of one card's spending landing at once is exactly the sort
-  // of number that looks wrong with no way to check it.
+  // Spell out what the figure was measured between, and how solid each end is.
+  // A "1-day" change that is really a week of one card's spending landing at
+  // once is exactly the sort of number that looks wrong with no way to check
+  // it — most of those are now filled in from the transactions, but a gap that
+  // wouldn't reconcile still carries, and it should say so rather than pass
+  // itself off as a day's worth.
   function changeTitle(c) {
     const bits = [`${c.from}  ${money(c.a.value)}  →  ${c.to}  ${money(c.b.value)}`];
     for (const p of [c.a, c.b]) {
       const day = dayKey(p.date);
-      if (p.live) {
-        bits.push(`${day} is your live balance, not a history point`);
-      } else if (p.of && p.fresh < p.of) {
+      if (p.live) bits.push(`${day} uses your live balances`);
+      if (p.derived) {
+        bits.push(`${p.derived} of ${p.of} balances on ${day} worked out from dated transactions`);
+      }
+      const carried = (p.of || 0) - (p.fresh || 0) - (p.derived || 0);
+      if (carried > 0) {
         bits.push(
-          `${p.fresh} of ${p.of} accounts reported on ${day} — the rest carry ` +
-            `their last known balance, so anything they did lands on the day ` +
-            `they next report`
+          `${carried} of ${p.of} accounts hadn't reported by ${day} and couldn't ` +
+            `be reconciled from transactions — their last known balance is carried, ` +
+            `so anything they did lands on the day they next report`
         );
       }
     }
@@ -1496,10 +1575,7 @@
         const h = sparkHeight(card, spark);
         // paintCard runs on every sweep; only redraw when something actually
         // changed, otherwise the graph flickers a few times a second.
-        // The last value is in the key as well as the length: anchoring the
-        // series to the live total rewrites today's point in place, and a key
-        // of length alone would leave the old shape on screen.
-        const key = `${series.length}:${series[series.length - 1].value}:${h}:${net < 0}`;
+        const key = `${seriesRev}:${h}:${net < 0}`;
         if (spark.dataset.ecdKey !== key) {
           spark.dataset.ecdKey = key;
           spark.style.height = h + 'px';
@@ -1511,6 +1587,7 @@
       }
     }
     ensureSeries();
+    loadTransactions();
   }
 
   // How much vertical room the card has left once the header and breakdown
@@ -1543,6 +1620,24 @@
   let series = null;
   let seriesError = null;
   let seriesTriedAt = 0;
+  let historyJson = null;
+  // Bumped on every rebuild. The sparkline redraws off this rather than off the
+  // series' length: a rebuild can change values all through the series without
+  // changing how many there are, and comparing lengths would leave the old
+  // shape on screen.
+  let seriesRev = 0;
+
+  // The series has three inputs that arrive at different times — the history
+  // call, the live balances, and the transactions. Rebuilding from whatever is
+  // to hand keeps it one function's job to combine them, rather than a set of
+  // patches applied to an already-built series in whatever order they land.
+  function rebuildSeries() {
+    if (!historyJson) return;
+    const s = seriesFrom(historyJson, txns);
+    if (!s.length) return;
+    series = s;
+    seriesRev++;
+  }
 
   async function ensureSeries() {
     if (series || !rawAccounts.length) return;
@@ -1550,7 +1645,7 @@
     seriesTriedAt = Date.now();
     try {
       series = await fetchSeries(SPARK_DAYS);
-      anchorSeries();
+      seriesRev++;
       seriesError = null;
       const c = document.getElementById(CARD_ID);
       if (c) paintCard(c);
@@ -1574,9 +1669,10 @@
       lastData = group(accounts);
       lastData.source = source;
       lastData.at = at;
-      // Accounts normally arrive before the history, but a refresh can land
-      // the other way round. Anchoring is idempotent, so run it either way.
-      anchorSeries();
+      // Balances are one of the series' inputs, so a fresh set of them is a
+      // reason to rebuild it. Accounts normally arrive first, but a refresh
+      // can land the other way round.
+      rebuildSeries();
       const c = document.getElementById(CARD_ID);
       if (c) paintCard(c);
     } catch (_) {
@@ -1783,14 +1879,30 @@
     loadTransactions();
   }
 
+  // Loaded as soon as there are accounts to load them for, rather than waiting
+  // for the detail view to open. The transaction dates are what let the series
+  // put a movement on the day it happened instead of the day the account got
+  // round to reporting it, so the card's own change figure needs them just as
+  // much as the list does. Opening the view is then instant, which is the
+  // agreeable half of paying for the call up front.
+  let txnTriedAt = 0;
+
   async function loadTransactions() {
-    if (txns) return;
+    if (txns || !rawAccounts.length) return;
+    if (Date.now() - txnTriedAt < 30000) return;
+    txnTriedAt = Date.now();
     try {
       txns = await fetchTransactions(TXN_DAYS);
       txnError = null;
+      // The transactions are an input to the graph, not just to the list.
+      rebuildSeries();
     } catch (e) {
       txnError = String((e && e.message) || e);
     }
+    // Repainted either way: on failure the view has to stop saying "loading"
+    // and start saying why.
+    const c = document.getElementById(CARD_ID);
+    if (c) paintCard(c);
     if (detailEl && detailEl.isConnected) renderDetail();
   }
 

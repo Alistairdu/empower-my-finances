@@ -144,22 +144,89 @@ headline figure comes from the accounts payload; the graph comes from
 history routinely stops at yesterday, or carries a row for today taken before
 this morning's sync. So the "1-day" change compared two history days while the
 headline had already moved on: right about the series, wrong about the question.
-The series is now **anchored to the live total** before anything draws it —
-today's point is rewritten from your current balances, or appended if history
-hasn't reached today. The anchor sums *only the accounts the history summed*,
-for the same reason `seriesFrom` carries balances forward: a total over a
-different set of accounts is a different figure, not a fresher one. If any of
-them is missing from the live payload, there is no comparable total and the
-history is left to speak for itself.
+Your live balances are now treated as **a reading for today like any other**,
+and a better one than history's, so the graph ends on the figure printed above
+it. They are taken per account rather than as one total: an account that arrives
+without a balance costs only its own reading, and the rest still update. An
+account with no balance field is skipped rather than read as zero — `normalise()`
+would call a missing balance 0, and a card at zero reads as paid off.
 
 **Carrying a balance forward moves an account's whole gap onto one day.** It is
 what keeps the total comparable across a reporting gap, but the flip side is
 that a card silent for a week posts seven days of spending as a single step. The
-money is real; it just isn't one day's worth. Each point now records how many
-accounts actually reported that day against how many are being carried, and the
-hover text says so — `3 of 5 accounts reported on 2026-07-27 — the rest carry
-their last known balance`. A step that looks too big now explains itself instead
-of just looking wrong.
+money is real; it just isn't one day's worth — and this was the bigger of the
+two errors. The fix is below.
+
+### The graph is drawn from the transactions, not just the balances
+
+We know when money moved: the transactions are dated. So the graph doesn't have
+to guess at a reporting gap, and it no longer does.
+
+Each account's balance for a day now comes from one of three places, in order
+of authority:
+
+1. **What it reported that day** — including a live balance, per above.
+2. **What the dated transactions say it must have been**, across a gap whose two
+   ends both reported and whose transactions add up to the difference.
+3. **Its last known balance, carried** — the old behaviour, now the last resort
+   rather than the only option.
+
+Inside a gap that reconciles, *every* calendar day is known, not just the ones a
+transaction is dated on: the balance is the earlier reading plus everything
+dated on or before that day, and the later reading proves the sum. The quiet
+days in between are the flat stretches of the graph, and they are as known as
+the days money moved. A weekend the banks don't report on is drawn, and a
+Saturday purchase lands on Saturday rather than on Monday — where it used to
+read as a three-day step.
+
+**Reconciling to the cent is the whole safeguard.** A gap is filled only when
+its transactions account for the difference exactly. A pending charge, an
+interest posting, a transaction window that doesn't reach back far enough — any
+of them and the sums won't meet, which means the gap isn't understood, and it
+carries forward as before rather than being filled with something
+plausible-looking. Being a cent out is enough to refuse.
+
+Two things that look like the same case but aren't:
+
+- **Not having the transactions is not the same as an account having none.** A
+  gap whose balance ends where it started reconciles against an empty list
+  trivially, and would be drawn flat on no evidence at all. So nothing is
+  derived until the list is actually loaded, and only back as far as it was
+  asked to cover — before that, "no transactions" means "none loaded", not
+  "none happened".
+- **A movement with nothing to prove it is left out.** If an account never
+  reports again, there is no closing balance to check its transactions against,
+  and they aren't drawn. Its balance carries, as it always did.
+
+Signs need no conversion between the two sources: the series holds a card as a
+negative amount owed, and transaction amounts are already signed
+money-in/money-out, so a $100 card purchase is −100 to both, and a $500 card
+payment is +500 to both. A card payment therefore nets to zero on the day it
+clears, which is what it should do to *net* cash.
+
+This is why transactions are now loaded as soon as there are accounts to load
+them for, rather than when the detail view opens — the card's own graph and
+change figure need them. Opening the view is instant as a result, which is the
+agreeable half of paying for the call up front.
+
+Hovering a change figure says which of the three it relied on: `2 of 5 balances
+on 2026-07-27 worked out from dated transactions`, or `1 of 5 accounts hadn't
+reported by 2026-07-27 and couldn't be reconciled from transactions`. A step
+that still looks too big explains itself rather than just looking wrong.
+
+## Tests
+
+```
+node test.js
+```
+
+No dependencies, no build step, nothing to install. The series arithmetic is the
+one part of this that can be wrong without *looking* wrong — a balance graph
+draws a confident line through whatever it is handed — so the functions that
+build it are lifted out of `content.js` by name and run against made-up history
+and transactions, where the right answer is known. The source is read rather
+than copied, so a passing test is a statement about the code that actually
+ships.
 
 The graph is measured to fill whatever height the card has left, after the
 header, the breakdown and the change row have taken theirs.
@@ -302,6 +369,11 @@ these are fetched directly:
 - `/api/account/getHistories` — daily balances, summed into net cash
 - `/api/transaction/getUserTransactions` — transactions for cash and card accounts
 
+Both feed the graph. The series is rebuilt from whatever is to hand each time
+one of its three inputs — history, live balances, transactions — arrives or
+moves on, so combining them stays one function's job rather than a set of
+patches applied in whatever order they land.
+
 Both need a valid CSRF token. Rather than scraping one, the script reads the
 token out of the request bodies the dashboard itself posts. Response parsing is
 deliberately tolerant of field-name changes across Empower's builds; if a call
@@ -320,9 +392,10 @@ reported at least once. Before that point there is no honest total to draw, so
 none is drawn — which is why the change label reports the span it actually
 measured rather than assuming 90 days are available.
 
-`anchorSeries()` then pins the last point to your live balances, so the graph
-ends on the figure printed above it. Both of these are why the daily change is
-what it is; see "Why the daily change used to read wrong" above.
+Carrying is now the last resort rather than the only option: where the dated
+transactions account for a gap exactly, they walk the balance across it day by
+day instead, and your live balances close the most recent gap. See "The graph is
+drawn from the transactions" above.
 
 ## Hiding Empower's own cards
 
