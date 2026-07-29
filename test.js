@@ -24,8 +24,8 @@ function grab(name) {
 
 const names = [
   'seriesFrom', 'flattenHistory', 'accountTypeById', 'changeAt', 'chartChange',
-  'lastChange', 'selectedChange', 'txnNet', 'indexOfDay', 'dayKey', 'isLive',
-  'normalise',
+  'lastChange', 'selectedChange', 'txnNet', 'reconcile', 'reconciledSpan',
+  'accountNames', 'indexOfDay', 'dayKey', 'isLive', 'normalise',
 ];
 
 const ctx = {
@@ -52,8 +52,8 @@ const section = (s) => console.log(`\n— ${s}`);
 
 const BANK = 1, CARD = 2;
 const accounts = [
-  { userAccountId: BANK, productType: 'BANK', balance: 0 },
-  { userAccountId: CARD, productType: 'CREDIT_CARD', balance: 0 },
+  { userAccountId: BANK, productType: 'BANK', balance: 0, name: 'Checking' },
+  { userAccountId: CARD, productType: 'CREDIT_CARD', balance: 0, name: 'Blue Card' },
 ];
 ctx.rawAccounts = accounts;
 
@@ -297,6 +297,60 @@ ctx.selFrom = ctx.selTo = null;
 eq('with nothing selected the figure is the last step', ctx.lastChange().delta, 0);
 eq('the graph end to end', ctx.chartChange().delta, 3500 - 4000);
 eq('...over the days it actually spans', ctx.chartChange().days, 4);
+
+// Everything is accounted for, so there is nothing to reconcile.
+eq('a fully explained span reconciles to nothing',
+  ctx.reconcile('2026-07-21', '2026-07-24'), []);
+
+// ---------------------------------------------------------------------------
+section('balance movement with no transaction behind it');
+// The same week, but the bank quietly gains 5 in interest on the 24th and the
+// card is charged a 12 fee on the 22nd. Neither posts as a transaction.
+noToday();
+const driftRows = [
+  [BANK, '2026-07-20', 5000], [BANK, '2026-07-21', 4800], [BANK, '2026-07-22', 4800],
+  [BANK, '2026-07-23', 4300], [BANK, '2026-07-24', 4305],
+  [CARD, '2026-07-20', 1000], [CARD, '2026-07-21', 1000], [CARD, '2026-07-22', 1312],
+  [CARD, '2026-07-23', 812], [CARD, '2026-07-24', 812],
+];
+ctx.series = ctx.seriesFrom(hist(driftRows), dailyTxns);
+ctx.txns = dailyTxns;
+
+eq('the interest is attributed to the bank, by name',
+  ctx.reconcile('2026-07-24', '2026-07-24'), [{ id: '1', name: 'Checking', amount: 5 }]);
+eq('the card fee is attributed to the card',
+  ctx.reconcile('2026-07-22', '2026-07-22'), [{ id: '2', name: 'Blue Card', amount: -12 }]);
+eq('over the whole week, both show up biggest first',
+  ctx.reconcile('2026-07-21', '2026-07-24').map((g) => [g.name, g.amount]),
+  [['Blue Card', -12], ['Checking', 5]]);
+
+// The point of the rows: listed transactions plus reconciling rows come to
+// exactly what the balances did.
+ctx.selFrom = '2026-07-21';
+ctx.selTo = '2026-07-24';
+const listed = ctx.txnNet('2026-07-21', '2026-07-24').sum;
+const unexplained = ctx.reconcile('2026-07-21', '2026-07-24').reduce((s, g) => s + g.amount, 0);
+eq('the list now adds up to the balance movement',
+  Math.round((listed + unexplained) * 100) / 100, ctx.selectedChange().delta);
+
+// A day where nothing posted but the balance moved anyway — the case the rows
+// exist for, since the list would otherwise say nothing happened.
+ctx.selFrom = ctx.selTo = '2026-07-24';
+eq('a day with no transactions still explains itself',
+  ctx.txnNet('2026-07-24', '2026-07-24'), { sum: 0, n: 0 });
+eq('...via the reconciling row', ctx.reconcile('2026-07-24', '2026-07-24')[0].amount, 5);
+eq('...which matches the day\'s balance movement', ctx.selectedChange().delta, 5);
+
+// The span reconciled is the selection, or the whole graph when there is none.
+eq('a selection sets the span', ctx.reconciledSpan(), { from: '2026-07-24', to: '2026-07-24' });
+ctx.selFrom = ctx.selTo = null;
+eq('otherwise it is the graph, from its second point',
+  ctx.reconciledSpan(), { from: '2026-07-21', to: '2026-07-24' });
+
+// Nothing to measure against before the first point.
+eq('the first point cannot be reconciled', ctx.reconcile('2026-07-20', '2026-07-20'), []);
+ctx.txns = null;
+eq('nor can anything without the transactions', ctx.reconcile('2026-07-24', '2026-07-24'), []);
 
 Date.now = realNow;
 console.log(fails ? `\n${fails} FAILED` : '\nall passed');

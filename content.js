@@ -593,6 +593,10 @@
         derived: worked,
         of: perAcct.size,
         live: day === today && live.size > 0,
+        // The per-account balances behind the total, so a discrepancy between
+        // the graph and the transaction list can be attributed to the account
+        // it came from. A copy: `carry` goes on being mutated.
+        parts: new Map(carry),
       });
     }
     return out;
@@ -1484,6 +1488,73 @@
     return { sum, n };
   }
 
+  function accountNames() {
+    const m = new Map();
+    for (const a of rawAccounts) {
+      const id = String(a.userAccountId ?? a.accountId ?? a.id);
+      m.set(id, a.name || a.originalName || a.firmName || '');
+    }
+    return m;
+  }
+
+  // Where a span's balance movement isn't accounted for by the transactions,
+  // and on which account.
+  //
+  // Per account rather than as one lump, because the lump is a dead end: "$412
+  // unexplained" tells you something is off and nothing else, where "$412
+  // unexplained on Checking" tells you where to go and look. The two sides come
+  // from different endpoints — balances from getHistories, movements from
+  // getUserTransactions — and neither payload says why they disagree, so this
+  // is the one figure in the view that can be measured but not derived.
+  // Interest and fees are the usual answers; a charge that has hit the balance
+  // but not yet posted as a row is the other.
+  //
+  // Measured from the point *before* the first day, so the first day's own
+  // movement is inside the span — the same rule the change figure uses, so the
+  // two agree.
+  function reconcile(from, to) {
+    if (!series || series.length < 2 || !txns || !from || !to) return [];
+    const i = indexOfDay(series, from);
+    const j = indexOfDay(series, to);
+    if (i === null || j === null) return [];
+    const lo = Math.min(i, j) - 1;
+    if (lo < 0) return [];
+    const opening = series[lo].parts;
+    const closing = series[Math.max(i, j)].parts;
+    if (!opening || !closing) return [];
+
+    const net = new Map();
+    for (const t of txns) {
+      if (!t.day || t.day < from || t.day > to) continue;
+      net.set(t.acctId, (net.get(t.acctId) || 0) + t.amount);
+    }
+
+    const names = accountNames();
+    const out = [];
+    for (const [id, after] of closing) {
+      // An account with no opening balance hasn't moved as far as we can tell.
+      const moved = after - (opening.has(id) ? opening.get(id) : after);
+      const diff = Math.round((moved - (net.get(id) || 0)) * 100) / 100;
+      if (!diff) continue;
+      out.push({ id, name: names.get(id) || 'an account', amount: diff });
+    }
+    // Biggest discrepancy first — that's the one worth chasing.
+    return out.sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount));
+  }
+
+  // The days the transaction list is currently reconciled over: the selection
+  // if there is one, otherwise the whole graph. Not the whole loaded list —
+  // transactions dated before the series starts have no opening balance to be
+  // measured against, so there is nothing to reconcile them to.
+  function reconciledSpan() {
+    if (!series || series.length < 2) return null;
+    if (selFrom) return { from: selFrom, to: selTo };
+    return {
+      from: dayKey(series[1].date),
+      to: dayKey(series[series.length - 1].date),
+    };
+  }
+
   // Why each end of a comparison is or isn't solid ground.
   function pointNotes(p) {
     const day = dayKey(p.date);
@@ -1993,9 +2064,14 @@
         : sel
           ? `nothing ${escapeHtml(sel)}${unloaded}`
           : 'every transaction is a transfer';
+      // A day with no transactions whose balance moved anyway is precisely when
+      // the reconciling rows earn their place: without them the view would say
+      // "nothing happened" over a graph that visibly stepped.
+      const recon = reconRows();
       return (
         `<div class="ecd-d-tally">0 of ${txns.length} transactions${clear}</div>` +
-        `<div class="ecd-d-note">Nothing matches — ${why}.</div>`
+        `<div class="ecd-d-note">Nothing matches — ${why}.</div>` +
+        (recon ? `<table class="ecd-d-table"><tbody>${recon}</tbody></table>` : '')
       );
     }
     // Every match is rendered — no cap. A cap needs a "showing the first N"
@@ -2016,8 +2092,44 @@
       .join('');
     return (
       `<div class="ecd-d-tally">${shown.length} of ${txns.length} transactions${clear}</div>` +
-      `<table class="ecd-d-table"><tbody>${rows}</tbody></table>`
+      `<table class="ecd-d-table"><tbody>${rows}${reconRows()}</tbody></table>`
     );
+  }
+
+  // The balance movement the listed transactions don't account for, as rows at
+  // the foot of the list — one per account, named. It belongs here rather than
+  // in a tooltip: it is money that moved, the list is the record of money that
+  // moved, and leaving it out is what made the totals disagree in the first
+  // place. With these, the rows above plus the rows below come to what the
+  // balances actually did.
+  //
+  // Not shown while a search is running. The visible rows are then a subset
+  // chosen by a word, and the balance movement has nothing to do with that
+  // word — a reconciling line under it would be arithmetic about two unrelated
+  // things. The "− net payments" toggle is fine: a pair is equal and opposite,
+  // so hiding both legs changes the total by zero.
+  function reconRows() {
+    if (txnQuery.trim()) return '';
+    const span = reconciledSpan();
+    if (!span) return '';
+    const gaps = reconcile(span.from, span.to);
+    if (!gaps.length) return '';
+    const when = span.from === span.to ? `on ${span.from}` : `${span.from} → ${span.to}`;
+    return gaps
+      .map((g) => {
+        const title =
+          `${g.name} moved ${signed(g.amount)} ${when} with no transaction to show ` +
+          `for it. Interest or a fee, a charge that has hit the balance but not ` +
+          `posted as a row yet, or a transaction Empower didn't return.`;
+        return (
+          `<tr class="ecd-d-recon" title="${escapeHtml(title)}">` +
+          `<td class="ecd-d-date"></td>` +
+          `<td>Unexplained ${g.amount < 0 ? 'decrease' : 'increase'} — not in the transactions</td>` +
+          `<td class="ecd-d-acct">${escapeHtml(g.name)}</td>` +
+          `<td class="ecd-d-amt ${g.amount < 0 ? 'ecd-d-out' : 'ecd-d-in'}">${signed(g.amount)}</td></tr>`
+        );
+      })
+      .join('');
   }
 
   // Only the rows are rebuilt on a filter change. Re-rendering the whole view
@@ -2456,6 +2568,10 @@
      sampled card background, so it stays readable light or dark. */
   #ecd-detail .ecd-d-in{color:var(--ecd-pos,#127a45)}
   #ecd-detail .ecd-d-out{color:var(--ecd-neg,#c0392b)}
+  /* Reconciling rows close the list, and are not transactions — a heavier top
+     rule and italics say so without needing a heading to explain it. */
+  #ecd-detail .ecd-d-recon td{border-top:2px solid rgba(128,128,128,.45);
+    font-style:italic;opacity:.85}
   #ecd-pick-banner{position:fixed;top:0;left:0;right:0;z-index:2147483002;
     background:#0f2942;color:#fff;padding:11px;text-align:center;
     font:600 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}

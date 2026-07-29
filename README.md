@@ -141,10 +141,9 @@ removing both legs removes zero. The search box doesn't apply either: it is a
 way of finding a row, not a redefinition of what the days came to.
 
 One consequence worth knowing: **a day whose transactions haven't posted yet
-reads as zero**, because that is what the list says too. Hovering gives the
-balance movement over the same days and names the difference — interest, a fee,
-or a charge still pending. That difference is the one number here that no amount
-of care in this file can derive, so it is reported rather than absorbed.
+reads as zero**, because that is what the list says too. Where the balances moved
+by something the transactions don't show, the list says so on its own line — see
+below.
 
 Hovering either figure shows what it was measured between: both dates, both
 totals, and any reason the two ends aren't strictly comparable (see below).
@@ -317,6 +316,42 @@ The day filter stacks with the search and the transfer toggle: all three apply
 at once, in `visibleTxns()`. The change figure at the bottom-right of the graph
 follows the selection as well, and is the net of exactly the rows the selection
 puts in the list.
+
+### What the transactions don't account for
+
+Two things describe the same days and don't always agree: the balances, from
+`getHistories`, and the itemised movements, from `getUserTransactions`. They
+drift apart for real reasons — interest credited, a monthly fee, a charge that
+has hit the balance but hasn't posted as a row yet, a transaction Empower
+didn't return. Neither payload says why. It is the one figure in the view that
+can be *measured* but not derived: the code can tell you the gap to the cent and
+cannot tell you what it consists of.
+
+So it is reported rather than absorbed, and reported **as rows at the foot of
+the transaction list** — because it is money that moved, the list is the record
+of money that moved, and leaving it out is what made the totals disagree in the
+first place. With those rows, the transactions above plus the reconciling rows
+below come to exactly what the balances did.
+
+**One row per account, named.** A single lump is a dead end: "$412 unexplained"
+tells you something is off and nothing else, where "$412 unexplained on
+Checking" tells you where to go and look. Per-account balances are kept on each
+series point for this, so a discrepancy can be attributed to the account it came
+from. Biggest first — that is the one worth chasing.
+
+The rows cover the selection if there is one, otherwise the whole graph. Not the
+whole loaded list: transactions dated before the series starts have no opening
+balance to be measured against, so there is nothing to reconcile them to.
+
+They are **not shown while a search is running.** The visible rows are then a
+subset chosen by a word, and the balance movement has nothing to do with that
+word — a reconciling line under it would be arithmetic about two unrelated
+things. The `− net payments` toggle is fine: a pair is equal and opposite, so
+hiding both legs changes the total by zero.
+
+They also appear when nothing else matches. A selected day with no transactions
+whose balance moved anyway is the case they exist for — without them the view
+would say "nothing happened" over a graph that visibly stepped.
 
 ### Filtering the transaction list
 
