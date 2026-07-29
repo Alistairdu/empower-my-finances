@@ -229,12 +229,23 @@ the days money moved. A weekend the banks don't report on is drawn, and a
 Saturday purchase lands on Saturday rather than on Monday — where it used to
 read as a three-day step.
 
-**Reconciling to the cent is the whole safeguard.** A gap is filled only when
-its transactions account for the difference exactly. A pending charge, an
-interest posting, a transaction window that doesn't reach back far enough — any
-of them and the sums won't meet, which means the gap isn't understood, and it
-carries forward as before rather than being filled with something
-plausible-looking. Being a cent out is enough to refuse.
+**The dated transactions are laid down whether or not they add up.** An earlier
+version required them to reconcile to the cent and refused the whole window
+otherwise. As a rule it sounds careful — never invent a balance the data can't
+prove — but against a real feed almost no window survives it. One fee, one
+interest posting, one charge that hasn't appeared as a row yet, and the window
+is refused and carried flat. Ninety days of windows each needing to be perfect
+meant that in practice nothing ever derived at all: the graph stayed flat, the
+subtotals never moved, and every transaction produced a reconciling row pointing
+straight back at itself.
+
+**The reading at the far end is what keeps it honest.** It is left exactly as
+reported, so the line snaps back to a known figure at every anchor, and whatever
+the transactions failed to explain lands there as a single residual on the day
+the balance really moved. One disclosed row at the boundary beats a wrong row on
+every day between, and between the anchors the dated transactions are the best
+account anyone has of when the money moved. A cent out is still a cent, reported
+— it just no longer costs the whole window.
 
 Two things that look like the same case but aren't:
 

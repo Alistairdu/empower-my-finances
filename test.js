@@ -143,18 +143,41 @@ eq('the long figure is the graph end to end',
 eq('...and reports the span it covers', ctx.chartChange().days, 8);
 
 // ---------------------------------------------------------------------------
-section('a gap the transactions do not account for');
-// The card closes at 2650, but only 600 of the 650 is explained. Filling the
-// gap would mean inventing the other 50, so it carries as before.
-const short = [...bankRows, [CARD, '2026-07-20', 2000], [CARD, '2026-07-28', 2650]];
+section('a window the transactions only partly explain');
+// The card closes at 2650, but the two purchases come to only 600 of the 650.
+// The transactions are still laid down on their own days — they are the only
+// account of when the money moved — and the 50 nobody can explain lands on the
+// day the balance is actually known to have changed. One disclosed row at the
+// boundary, rather than a wrong row on each day between.
+const flatBank = [];
+for (let d = 20; d <= 28; d++) flatBank.push([BANK, `2026-07-${d}`, 5000]);
+const short = [...flatBank, [CARD, '2026-07-20', 2000], [CARD, '2026-07-28', 2650]];
 const s2 = ctx.seriesFrom(hist(short), spend);
 ctx.series = s2; ctx.residualCache = null;
-eq('unreconciled gap carries', values(s2).slice(1, 8).map((v) => v[1]),
-  [3100, 3200, 3300, 3400, 3500, 3600, 3700]);
-eq('and says an account was carried', [s2[4].fresh, s2[4].derived, s2[4].of], [1, 0, 2]);
-eq('a cent short is still short', ctx.seriesFrom(
-  hist([...bankRows, [CARD, '2026-07-20', 2000], [CARD, '2026-07-28', 2600.01]]), spend
-)[4].derived, 0);
+ctx.txns = spend;
+ctx.seriesRev++;
+eq('the purchases land on their own days',
+  values(s2),
+  [['20', 3000], ['21', 3000], ['22', 2800], ['23', 2800], ['24', 2800],
+   ['25', 2400], ['26', 2400], ['27', 2400], ['28', 2350]]);
+eq('the days between are derived', [s2[3].fresh, s2[3].derived, s2[3].of], [1, 1, 2]);
+eq('nothing to report on a purchase day', ctx.reconcile('2026-07-22', '2026-07-22'), []);
+eq('the shortfall shows once, where the balance moved',
+  ctx.reconcile('2026-07-28', '2026-07-28').map((g) => [g.name, g.kind, g.amount]),
+  [['Blue Card', 'unexplained', -50]]);
+eq('and once across the whole window',
+  ctx.reconcile('2026-07-21', '2026-07-28').map((g) => [g.kind, g.amount]),
+  [['unexplained', -50]]);
+
+// A cent is still a discrepancy; it just no longer costs the whole window.
+const cent = ctx.seriesFrom(
+  hist([...flatBank, [CARD, '2026-07-20', 2000], [CARD, '2026-07-28', 2600.01]]), spend);
+ctx.series = cent; ctx.residualCache = null;
+ctx.seriesRev++;
+eq('a cent short is a cent, reported',
+  ctx.reconcile('2026-07-28', '2026-07-28').map((g) => [g.kind, g.amount]),
+  [['unexplained', -0.01]]);
+eq('...without refusing the window', cent[4].derived, 1);
 
 // ---------------------------------------------------------------------------
 section('transaction days history never reported');
@@ -397,42 +420,35 @@ eq('nor can anything without the transactions', ctx.reconcile('2026-07-24', '202
 
 // ---------------------------------------------------------------------------
 section('an account that has gone quiet is not an account with a discrepancy');
-// The card reports 2000 owed on the 20th and nothing until the 28th at 2650.
-// Its two purchases come to 600, so the gap does not reconcile (a 50 fee never
-// posted) and the balance carries. Measured naively, every day in the silence
-// looks like unexplained money, and the whole silence lands on the 28th.
+// The card reports on the 20th and never again. With no later reading there is
+// no window to close, so its balance is carried and its transactions cannot be
+// placed against anything. That is a statement about reporting, not about
+// money, and it says so rather than accusing the account.
 noToday();
-const quietRows = [...bankRows, [CARD, '2026-07-20', 2000], [CARD, '2026-07-28', 2650]];
-ctx.series = ctx.seriesFrom(hist(quietRows), spend); ctx.residualCache = null;
-ctx.txns = spend;
-eq('the gap did not reconcile, so the card is carried',
-  ctx.series[5].held.has('2'), true);
-eq('the bank reported, so it is not', ctx.series[5].held.has('1'), false);
+const quietRows = [];
+for (let d = 20; d <= 28; d++) quietRows.push([BANK, `2026-07-${d}`, 5000]);
+quietRows.push([CARD, '2026-07-20', 1000]);
+const quietTxns = loaded([txn(CARD, '2026-07-22', -134)]);
+ctx.series = ctx.seriesFrom(hist(quietRows), quietTxns); ctx.residualCache = null;
+ctx.txns = quietTxns;
+ctx.seriesRev++;
 
-// The 25th: a 400 purchase the card's balance knows nothing about yet.
-const quiet = ctx.reconcile('2026-07-25', '2026-07-25');
-eq('the day of a purchase during the silence', [quiet[0].name, quiet[0].amount], ['Blue Card', 400]);
-eq('...is reported as a balance that has not caught up', quiet[0].kind, 'stale');
-eq('...naming when the account last spoke', quiet[0].when, '2026-07-20');
+eq('the card is carried, having said nothing since the 20th',
+  ctx.series[2].held.has('2'), true);
+eq('the bank is not', ctx.series[2].held.has('1'), false);
 
-// The 28th: the balance finally arrives, carrying the whole week at once.
-const resumed = ctx.reconcile('2026-07-28', '2026-07-28');
-eq('the day it resumes carries the whole silence', resumed[0].amount, -650);
-eq('...and is still a reporting story, not a money one', resumed[0].kind, 'stale');
+const quiet = ctx.reconcile('2026-07-22', '2026-07-22');
+eq('the charge is not called unexplained', quiet[0].kind, 'stale');
+eq('...it names the account', quiet[0].name, 'Blue Card');
+eq('...and when it last spoke', quiet[0].when, '2026-07-20');
+eq('...for the amount the list runs ahead by', quiet[0].amount, 134);
 
-// Across the whole silence, both ends reported, so what is left is the real
-// 50 that no transaction accounts for.
-const whole = ctx.reconcile('2026-07-21', '2026-07-28');
-eq('end to end, only the genuine shortfall remains',
-  whole.filter((g) => g.id === '2').map((g) => [g.amount, g.kind]), [[-50, 'unexplained']]);
-
-// The invariant holds throughout: listed plus reconciling equals the balances.
-for (const [a, b] of [['2026-07-25', '2026-07-25'], ['2026-07-28', '2026-07-28'], ['2026-07-21', '2026-07-28']]) {
-  ctx.selFrom = a;
-  ctx.selTo = b;
-  const sum = ctx.txnNet(a, b).sum + ctx.reconcile(a, b).reduce((s, g) => s + g.amount, 0);
-  eq(`${a}→${b}: the list still adds up`, Math.round(sum * 100) / 100, ctx.selectedChange().delta);
-}
+// The invariant holds regardless: listed plus reconciling equals the balances.
+ctx.selFrom = ctx.selTo = '2026-07-22';
+eq('the list still adds up',
+  ctx.txnNet('2026-07-22', '2026-07-22').sum +
+    ctx.reconcile('2026-07-22', '2026-07-22').reduce((t, g) => t + g.amount, 0),
+  ctx.selectedChange().delta);
 ctx.selFrom = ctx.selTo = null;
 
 // ---------------------------------------------------------------------------
@@ -534,13 +550,18 @@ for (const d of ['2026-07-09', '2026-07-10', '2026-07-11', '2026-07-12']) {
 eq('the day figure is the charge made that day', ctx.txnNet('2026-07-09', '2026-07-09').sum, -134);
 eq('...and matches the balance movement', ctx.selectedChangeOn('2026-07-09'), -134);
 
-// A window whose transactions do not add up is still refused, so a stale
-// reading is only overwritten where the sums prove it was stale.
-const unprovable = loaded([txn(CARD, '2026-07-09', -134)]);
-ctx.series = ctx.seriesFrom(hist(staleRows), unprovable); ctx.residualCache = null;
-eq('an unproven window keeps the reported figures',
+// With only one of the three charges listed, the one we have still lands on
+// its own day and the rest shows up where the balance moved.
+const partial = loaded([txn(CARD, '2026-07-09', -134)]);
+ctx.series = ctx.seriesFrom(hist(staleRows), partial); ctx.residualCache = null;
+ctx.txns = partial;
+ctx.seriesRev++;
+eq('the known charge still lands on its day',
   values(ctx.series),
-  [['08', 4000], ['09', 4000], ['10', 4000], ['11', 4000], ['12', 3640]]);
+  [['08', 4000], ['09', 3866], ['10', 3866], ['11', 3866], ['12', 3640]]);
+eq('and the rest is disclosed where the balance moved',
+  ctx.reconcile('2026-07-12', '2026-07-12').map((g) => [g.kind, g.amount]),
+  [['unexplained', -226]]);
 
 // ---------------------------------------------------------------------------
 section('the reported version is the shipped version');

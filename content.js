@@ -11,7 +11,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.28.0';
+  const VERSION = '0.29.0';
 
   // The same file is injected into both the page's MAIN world (where
   // `window.csrf` is reachable) and the extension's ISOLATED world (which
@@ -653,23 +653,28 @@
       for (let k = 0; haveTxns && k + 1 < said.length; k++) {
         const a = said[k];
         const b = said[k + 1];
+        // Before the transaction window there is no list to lay down, and an
+        // absent one would read as a flat stretch we have no evidence for.
         if (a < txnFrom) continue;
 
-        let total = 0;
-        for (const [d, amt] of mv) if (d > a && d <= b) total += amt;
-        // Doesn't add up: the gap isn't understood, so leave it to be carried.
-        if (cents(total) !== cents(m.get(b) - m.get(a))) continue;
-
-        // Every calendar day between the two readings, not just the ones a
-        // transaction is dated on. Inside a window that reconciles, the balance
-        // on each day is known exactly: it is the earlier reading plus whatever
-        // is dated on or before that day, and the later reading proves the sum.
-        // The quiet days in between are the flat stretches of the graph, and
-        // they are as known as the days money moved.
+        // The dated transactions are laid down on their own days, whether or
+        // not they add up to the movement between the two readings.
         //
-        // This overwrites any repeated reading inside the window, which is the
-        // point: the sums prove the feed was republishing a stale figure, and
-        // the transaction dates say when the money actually moved.
+        // Requiring them to add up exactly was the mistake, and it was mine.
+        // As a rule it sounds careful — never invent a balance the data can't
+        // prove — but against a real feed almost no window survives it. One
+        // fee, one interest posting, one charge that hasn't appeared as a row
+        // yet, and the entire window is refused and carried flat. Ninety days
+        // of windows, each needing to be perfect, and in practice nothing ever
+        // derived at all: the graph stayed flat, the subtotals never moved, and
+        // every transaction produced a reconciling row pointing back at itself.
+        //
+        // The reading at the far end is what keeps this honest. It is left
+        // exactly as reported, so the line snaps back to the known figure at
+        // every anchor and whatever the transactions failed to explain lands
+        // there as a single residual, on the day the balance really moved. One
+        // disclosed row at the boundary beats a wrong row on every day between,
+        // and the shape in between is the best account anyone has of it.
         let v = m.get(a);
         for (let d = nextDay(a); d < b; d = nextDay(d)) {
           v += mv.get(d) || 0;
