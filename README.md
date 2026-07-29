@@ -117,9 +117,9 @@ questions, and each can be checked against something else on the screen.
 
 **Left is the graph itself, end to end.** Read the first and last points off the
 picture and this is their difference. Not a fixed 90-day window: the graph draws
-`SPARK_DAYS` (180) of history, so a 90-day figure under a 180-day picture is a
-number you can't check against what you're looking at, and the two won't agree
-because they aren't measuring the same thing. The label reports the span
+`SPARK_DAYS` of history, so a fixed 90-day figure under a chart of any other
+length is a number you can't check against what you're looking at, and the two
+won't agree because they aren't measuring the same thing. The label reports the span
 actually covered, so a short history reads "60-day" rather than claiming a
 window it hasn't got.
 
@@ -136,7 +136,7 @@ match the list it sits above is a number you have to take on trust. The
 selection is read the way the list reads it — **both ends inclusive** — so the
 measurement starts at the point *before* the first selected day, and what
 happened on that day counts as part of it. Netting is unaffected by the
-`− net payments` toggle, since a pair is equal and opposite by definition and
+`− net pmts` toggle, since a pair is equal and opposite by definition and
 removing both legs removes zero. The search box doesn't apply either: it is a
 way of finding a row, not a redefinition of what the days came to.
 
@@ -147,6 +147,24 @@ below.
 
 Hovering either figure shows what it was measured between: both dates, both
 totals, and any reason the two ends aren't strictly comparable (see below).
+
+### The header follows the selection too
+
+Select a span on the graph and the figures above it — the net cash headline and
+the cash/cards pair — become the figures **as they stood at the end of that
+span**, with an `as of 2026-07-14` beside them. Series points carry their
+per-account balances, so this is only a matter of splitting them by product type:
+the same split `group()` does on the live payload, over a day that has already
+been.
+
+A selection is a question about a day that has passed, and answering it with
+today's balances beside a graph pinned to that day is exactly the sort of
+mismatch the rest of this file exists to remove. The date is never omitted — a
+stale number that looks live is worse than no number at all. Clearing the
+selection puts the live figures back.
+
+Cash minus cards equals the graph's own value at that point, at every point, so
+the header can't drift away from the picture.
 
 ### Why the daily change used to read wrong
 
@@ -297,6 +315,15 @@ skip the days inside them — days that have transactions even though no balance
 was reported. Dates are parsed and formatted in UTC throughout, so a step never
 lands on 23:00 the previous day when the clocks change.
 
+Dates are handled in UTC throughout *for arithmetic* — a day string parses as
+UTC midnight, so stepping one lands on midnight and never on 23:00 the day
+before when the clocks change. But "today" is a different question, and asking
+it in UTC was a bug: west of Greenwich, UTC rolls over in the early evening, so
+`ymd(Date.now())` started answering with tomorrow partway through the afternoon
+and the graph grew a point for a day that hadn't happened. `todayLocal()` asks
+the instant for its own offset — right on both sides of a daylight-saving
+change — and everything that means "today" now goes through it.
+
 Sliding a range moves both ends or neither: clamping one end at the edge of the
 chart would silently resize the range rather than move it. The arrows are
 ignored while the search box has focus, where they belong to the caret.
@@ -346,7 +373,7 @@ balance to be measured against, so there is nothing to reconcile them to.
 They are **not shown while a search is running.** The visible rows are then a
 subset chosen by a word, and the balance movement has nothing to do with that
 word — a reconciling line under it would be arithmetic about two unrelated
-things. The `− net payments` toggle is fine: a pair is equal and opposite, so
+things. The `− net pmts` toggle is fine: a pair is equal and opposite, so
 hiding both legs changes the total by zero.
 
 They also appear when nothing else matches. A selected day with no transactions
@@ -371,7 +398,7 @@ with both ends reported, what is left is the genuine shortfall.
 ### Filtering the transaction list
 
 The transactions heading is a toolbar: the heading on the left, a **search box**
-in the middle, and a **− net payments** toggle on the right.
+in the middle, and a **− net pmts** toggle on the right.
 
 Search matches the description and the account name, case-insensitively, so
 `amazon` pulls every Amazon row across all cards. It filters as you type.
@@ -382,15 +409,15 @@ you get the search back before you lose the view. The search starts empty
 each time the view opens, since a search is about the question you had a moment
 ago. The toggle is a way of reading the list, so it stays as you left it.
 
-**− net payments** hides movements where both legs are visible: money leaving one
+**− net pmts** hides movements where both legs are visible: money leaving one
 account and the same amount arriving in another, a few days apart. A credit card
 payment is the usual case, and a transfer between accounts is the same shape.
 They net to zero, so as a record of what was actually *spent* they are noise —
 and they double-count the amount while they're there. The button shows how many
 rows it will remove, and wears the same grey as those rows so the connection is
 visible rather than something to work out. Its sign says what the *click* will
-do rather than what the state is: `− net payments` takes them out, `+ net
-payments` puts them back.
+do rather than what the state is: `− net pmts` takes them out, `+ net pmts`
+puts them back.
 
 By default those rows are **shaded grey rather than removed** — the eye can skip
 them, and you can still see the payment happened. The button takes them out
@@ -419,10 +446,13 @@ than you expected is visible rather than silent. Every match is rendered — no
 row cap, because a cap needs a "showing the first N" caveat to stay honest and
 the list is a few hundred rows at worst.
 
-`TXN_DAYS` is deliberately tied to `SPARK_DAYS` rather than set independently.
-The graph selects into this list, so a shorter transaction window means dragging
-over the older half of the chart silently finds nothing: whatever you can point
-at, you can read. If a selection does land before everything loaded — Empower
+`TXN_DAYS` (180) is never shorter than `SPARK_DAYS` (90), and here deliberately
+longer. The graph selects into this list, so a shorter transaction window would
+mean dragging over the older half of the chart silently finds nothing: whatever
+you can point at, you can read. Running past the chart costs nothing and leaves
+the list useful in its own right — though the reconciling rows only reach as far
+back as the graph, since a transaction older than the series has no opening
+balance to be measured against. If a selection does land before everything loaded — Empower
 can cap the range server-side whatever you ask for — the empty state says
 "nothing is loaded before <date>" rather than implying the days were empty.
 

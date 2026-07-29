@@ -22,15 +22,29 @@ function grab(name) {
   throw new Error('unbalanced: ' + name);
 }
 
+// The same, for a `const name = ...` declaration: a braced arrow body ends at
+// its matching brace, a one-liner at the first semicolon.
+function grabConst(name) {
+  const i = src.indexOf(`\n  const ${name} = `);
+  if (i < 0) throw new Error('not found: ' + name);
+  let d = 0, braced = false;
+  for (let j = i; j < src.length; j++) {
+    const c = src[j];
+    if (c === '{') { d++; braced = true; }
+    else if (c === '}') { d--; if (braced && d === 0) return src.slice(i, j + 1) + ';'; }
+    else if (c === ';' && d === 0 && !braced) return src.slice(i, j + 1);
+  }
+  throw new Error('unbalanced: ' + name);
+}
+
 const names = [
   'seriesFrom', 'flattenHistory', 'accountTypeById', 'changeAt', 'chartChange',
   'lastChange', 'selectedChange', 'txnNet', 'reconcile', 'reconciledSpan',
-  'accountNames', 'lastReported', 'indexOfDay', 'dayKey', 'isLive', 'normalise',
+  'accountNames', 'lastReported', 'totalsAt', 'indexOfDay', 'dayKey', 'isLive', 'normalise',
 ];
 
 const ctx = {
   DAY_MS: 86400000,
-  ymd: (d) => new Date(d).toISOString().slice(0, 10),
   LIABILITIES: new Set(['CREDIT_CARD', 'LOAN', 'MORTGAGE']),
   rawAccounts: [],
   series: null,
@@ -39,8 +53,15 @@ const ctx = {
   selTo: null,
   Date, Set, Map, Number, String, Math, JSON, isFinite, Array, Object, console,
 };
+// Function declarations become properties of the context; `const` bindings are
+// lexical and don't, so they are handed out explicitly.
+const consts = ['ymd', 'shiftDay', 'todayLocal'];
+const expose = consts.map((n) => `globalThis.${n} = ${n};`).join('\n');
 vm.createContext(ctx);
-vm.runInContext(names.map(grab).join('\n'), ctx);
+vm.runInContext(
+  names.map(grab).concat(consts.map(grabConst)).join('\n') + '\n' + expose,
+  ctx
+);
 
 let fails = 0;
 const eq = (label, got, want) => {
@@ -59,6 +80,19 @@ ctx.rawAccounts = accounts;
 
 const realNow = Date.now;
 const setToday = (d) => { Date.now = () => Date.parse(d + 'T12:00:00Z'); };
+const setNow = (iso) => { Date.now = () => Date.parse(iso); };
+// Run something as if the browser were at a given UTC offset, in minutes west
+// (240 = New York in summer). todayLocal() asks the instant for its offset, so
+// stubbing it here is enough.
+const RealDate = Date;
+const atOffset = (mins, fn) => {
+  class TZ extends RealDate {
+    getTimezoneOffset() { return mins; }
+    static now() { return RealDate.now(); }
+  }
+  ctx.Date = TZ;
+  try { return fn(); } finally { ctx.Date = RealDate; }
+};
 // Before the series: no live reading is taken, so history stands alone.
 const noToday = () => setToday('2026-07-01');
 
@@ -396,6 +430,48 @@ for (const [a, b] of [['2026-07-25', '2026-07-25'], ['2026-07-28', '2026-07-28']
   eq(`${a}→${b}: the list still adds up`, Math.round(sum * 100) / 100, ctx.selectedChange().delta);
 }
 ctx.selFrom = ctx.selTo = null;
+
+// ---------------------------------------------------------------------------
+section('the cash and cards figures at the end of a selected span');
+noToday();
+ctx.series = ctx.seriesFrom(hist(rows), spend);
+// The 25th: bank at 5500, card at 2600 owed after both purchases.
+eq('subtotals as they stood that day',
+  ctx.totalsAt(ctx.series[5]), { BANK: 5500, CREDIT_CARD: 2600 });
+// Cards come back out positive — the series holds them the other way up, and
+// the header subtracts rather than adds.
+eq('the card is a positive amount owed', ctx.totalsAt(ctx.series[5]).CREDIT_CARD > 0, true);
+eq('cash minus cards is the graph point',
+  ctx.totalsAt(ctx.series[5]).BANK - ctx.totalsAt(ctx.series[5]).CREDIT_CARD,
+  ctx.series[5].value);
+// True at every point, which is what stops the header disagreeing with the graph.
+eq('...at every point on the graph',
+  ctx.series.every((p) => {
+    const t = ctx.totalsAt(p);
+    return Math.round((t.BANK - t.CREDIT_CARD) * 100) === Math.round(p.value * 100);
+  }), true);
+
+// ---------------------------------------------------------------------------
+section('today is the date it is here, not the date it is in Greenwich');
+// 22:00 on the 28th in New York is already the 29th in UTC.
+setNow('2026-07-29T02:00:00Z');
+eq('UTC has already rolled over', ctx.ymd(RealDate.now()), '2026-07-29');
+eq('but it is still the 28th here', atOffset(240, () => ctx.todayLocal()), '2026-07-28');
+eq('and east of Greenwich it can be the other way', atOffset(-660, () => ctx.todayLocal()), '2026-07-29');
+
+// The graph must not grow a point for a day that hasn't happened.
+accounts[0].balance = 5900;
+accounts[1].balance = 2650;
+const tz = atOffset(240, () => ctx.seriesFrom(hist(rows), spend));
+eq('the series ends today', tz[tz.length - 1].date, '2026-07-28');
+eq('...with no point for tomorrow', tz.filter((p) => p.date > '2026-07-28').length, 0);
+eq('...and today carries the live balances', tz[tz.length - 1].live, true);
+
+// Day arithmetic stays in UTC, where a day string is midnight and stepping one
+// lands on midnight — including across a daylight-saving boundary.
+eq('stepping forward over a spring change', ctx.shiftDay('2026-03-07', 1), '2026-03-08');
+eq('stepping back over it', ctx.shiftDay('2026-03-08', -1), '2026-03-07');
+eq('stepping forward over an autumn change', ctx.shiftDay('2026-10-31', 1), '2026-11-01');
 
 Date.now = realNow;
 console.log(fails ? `\n${fails} FAILED` : '\nall passed');

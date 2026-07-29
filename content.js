@@ -300,6 +300,26 @@
   const DAY_MS = 86400000;
   const ymd = (d) => new Date(d).toISOString().slice(0, 10);
 
+  // Stepping a day string. They parse as UTC midnight, so this stays on
+  // midnight and never lands on 23:00 the day before when the clocks change.
+  const shiftDay = (day, delta) => ymd(Date.parse(day) + delta * DAY_MS);
+
+  // The calendar date it is *here*.
+  //
+  // ymd() renders a moment as a UTC date, which is right for arithmetic on day
+  // strings and wrong for "today". West of Greenwich UTC has already rolled
+  // over by early evening, so ymd(Date.now()) starts answering with tomorrow
+  // partway through the afternoon — and the graph grows a point dated a day
+  // that hasn't happened. The dates we compare it against are calendar dates a
+  // bank assigned, not moments, so the local one is the one that matches.
+  //
+  // The offset is taken at the instant in question rather than from a fixed
+  // constant, so it is right on both sides of a daylight-saving change.
+  const todayLocal = () => {
+    const t = Date.now();
+    return ymd(t - new Date(t).getTimezoneOffset() * 60000);
+  };
+
   // Reduce whatever date shape a build hands back to a plain YYYY-MM-DD, so
   // history points and transactions can be compared to each other at all.
   function dayKey(v) {
@@ -529,7 +549,7 @@
     // recent gap against, which history alone never provides for the days
     // since it last spoke. Per account rather than as one total, so an account
     // missing from the payload costs only its own reading.
-    const today = ymd(Date.now());
+    const today = todayLocal();
     const live = new Set();
     for (const a of rawAccounts) {
       if (!isLive(a)) continue;
@@ -691,8 +711,8 @@
   async function fetchSeries(days) {
     const ids = cashAccountIds();
     if (!ids.length) throw new Error('no cash or credit card accounts found');
-    const s0 = ymd(Date.now() - days * DAY_MS);
-    const e0 = ymd(Date.now());
+    const e0 = todayLocal();
+    const s0 = shiftDay(e0, -days);
 
     const probes = [];
     let lastErr = null;
@@ -736,10 +756,10 @@
   async function fetchTransactions(days) {
     const ids = cashAccountIds();
     if (!ids.length) throw new Error('no cash or credit card accounts found');
-    const from = ymd(Date.now() - days * DAY_MS);
+    const from = shiftDay(todayLocal(), -days);
     const json = await apiPost('/api/transaction/getUserTransactions', {
       startDate: from,
-      endDate: ymd(Date.now()),
+      endDate: todayLocal(),
       userAccountIds: JSON.stringify(ids),
     });
     const rows = (json && json.spData && json.spData.transactions) || [];
@@ -1542,7 +1562,7 @@
 
   // What the listed transactions come to over a span of days.
   //
-  // Netting is unaffected by the "− net payments" toggle: a pair is equal and
+  // Netting is unaffected by the "− net pmts" toggle: a pair is equal and
   // opposite by definition, so removing both legs removes zero. The search box
   // doesn't apply either — that is a way of finding a row, not a redefinition
   // of what the days came to.
@@ -1742,6 +1762,37 @@
     return out + chgHtml(label, net ? net.sum : bal.delta, spanTitle(bal, net, from, to), accent);
   }
 
+  // The cash and cards subtotals as they stood at the end of a selected span,
+  // rather than as they stand now.
+  //
+  // Series points carry their per-account balances, so this is a matter of
+  // splitting them by product type — the same split `group()` does on the live
+  // payload, over a day that has already been. Cards come back out as a
+  // positive amount owed, which is the shape subHtml() and the headline both
+  // expect; the series holds them the other way up.
+  function totalsAt(point) {
+    if (!point || !point.parts) return null;
+    const typeById = accountTypeById();
+    const t = { BANK: 0, CREDIT_CARD: 0 };
+    for (const [id, v] of point.parts) {
+      if (typeById.get(id) === 'CREDIT_CARD') t.CREDIT_CARD += -v;
+      else t.BANK += v;
+    }
+    return t;
+  }
+
+  // What the header should show: the end of the selection if there is one,
+  // otherwise the live figures. A selection is a question about a day that has
+  // passed, and answering it with today's balances beside a graph pinned to
+  // that day is the sort of mismatch this whole file exists to remove.
+  function headerTotals() {
+    if (selFrom && series && series.length) {
+      const i = indexOfDay(series, selTo);
+      if (i !== null) return { totals: totalsAt(series[i]), asOf: dayKey(series[i].date) };
+    }
+    return { totals: lastData ? lastData.totals : null, asOf: '' };
+  }
+
   // Cash over cards, stacked with the figures in their own right-aligned
   // column. The whole point of the pair is eyeballing the gap between the two
   // numbers, which a single run-on line leaves you to do in your head.
@@ -1896,12 +1947,19 @@
   // hidden — they are excluded from the stash rather than blanket-restored.
   // ---------------------------------------------------------------------------
 
-  const SPARK_DAYS = 180;
+  const SPARK_DAYS = 90;
 
-  // Tied to the graph's window on purpose: the graph selects into this list,
-  // so a shorter transaction window means dragging over the older half of the
-  // chart silently finds nothing. Whatever you can point at, you can read.
-  const TXN_DAYS = SPARK_DAYS;
+  // Never shorter than the graph's window, and here deliberately longer. The
+  // graph selects into this list, so a shorter transaction window would mean
+  // dragging over the older half of the chart silently finds nothing: whatever
+  // you can point at, you can read. Running past the chart costs nothing and
+  // leaves the list useful in its own right.
+  //
+  // The reconciling rows only cover what the graph covers, since a transaction
+  // older than the series has no opening balance to be measured against — so
+  // the list can show rows the reconciliation doesn't reach. That is why the
+  // reconciled span is named on the rows rather than assumed.
+  const TXN_DAYS = 180;
 
   let detailEl = null;
   let txns = null;
@@ -1919,16 +1977,13 @@
     selTo = to;
     refreshRows();
     refreshChange();
+    refreshHeader();
   }
 
   function clearSelection() {
     selectDays(null, null);
     if (repaintSelection) repaintSelection();
   }
-
-  // Parsed and formatted in UTC throughout, so stepping a day never lands on
-  // 23:00 the same day when the clocks change.
-  const shiftDay = (day, delta) => ymd(Date.parse(day) + delta * DAY_MS);
 
   // Arrow keys walk the selection along the chart. Steps by calendar day
   // rather than by series index: the series can have gaps, and stepping by
@@ -2201,7 +2256,7 @@
   // Not shown while a search is running. The visible rows are then a subset
   // chosen by a word, and the balance movement has nothing to do with that
   // word — a reconciling line under it would be arithmetic about two unrelated
-  // things. The "− net payments" toggle is fine: a pair is equal and opposite,
+  // things. The "− net pmts" toggle is fine: a pair is equal and opposite,
   // so hiding both legs changes the total by zero.
   function reconRows() {
     if (txnQuery.trim()) return '';
@@ -2262,6 +2317,26 @@
     foot.innerHTML = series && series.length > 1 ? changeHtml(accentFor(detailEl)) : '';
   }
 
+  // The header follows the selection too, so the figures above the graph are
+  // the figures at the end of the span the graph is pinned to. Patched in place
+  // rather than re-rendered, for the same reason as the rows: rebuilding the
+  // view would take the search box's focus with it.
+  function refreshHeader() {
+    if (!detailEl) return;
+    const { totals, asOf } = headerTotals();
+    const net = totals ? totals.BANK - totals.CREDIT_CARD : 0;
+    const accent = accentFor(detailEl);
+    const hero = detailEl.querySelector('.ecd-d-hero');
+    if (hero) {
+      hero.textContent = totals ? money(net) : '—';
+      hero.style.color = net < 0 ? accent.neg : accent.pos;
+    }
+    const when = detailEl.querySelector('.ecd-d-asof');
+    if (when) when.textContent = asOf ? 'as of ' + asOf : '';
+    const sub = detailEl.querySelector('.ecd-d-sub');
+    if (sub) sub.innerHTML = subHtml(totals);
+  }
+
   function pairedCount() {
     return txns ? txns.filter((t) => t.paired).length : 0;
   }
@@ -2270,14 +2345,14 @@
   // payments out, + puts them back.
   function toggleLabel() {
     const n = pairedCount();
-    return `${hidePaired ? '+' : '−'} net payments${n ? ` (${n})` : ''}`;
+    return `${hidePaired ? '+' : '−'} net pmts${n ? ` (${n})` : ''}`;
   }
 
   function toolbarHtml() {
     return (
       `<div class="ecd-d-bar">` +
       `<span class="ecd-d-section">Transactions</span>` +
-      `<input class="ecd-d-search" type="search" placeholder="Search transactions" ` +
+      `<input class="ecd-d-search" type="search" placeholder="Search" ` +
       `value="${escapeHtml(txnQuery)}">` +
       `<button class="ecd-d-toggle${hidePaired ? ' ecd-on' : ''}" type="button" ` +
       `aria-pressed="${hidePaired}" title="Transfers and card payments where ` +
@@ -2319,7 +2394,7 @@
     // the dashboard's own background the same way the chart's fill does.
     detailEl.style.setProperty('--ecd-pos', accentPair.pos);
     detailEl.style.setProperty('--ecd-neg', accentPair.neg);
-    const totals = lastData ? lastData.totals : null;
+    const { totals, asOf } = headerTotals();
     const net = totals ? totals.BANK - totals.CREDIT_CARD : 0;
     const accent = net < 0 ? accentPair.neg : accentPair.pos;
     const ink = 'currentColor';
@@ -2339,6 +2414,10 @@
       `<div class="ecd-d-head">` +
       `<span class="ecd-d-title" title="Back to the Overview">${CARD_TITLE}</span>` +
       `<span class="ecd-d-hero" style="color:${accent}">${totals ? money(net) : '—'}</span>` +
+      // Never let a past figure pass for the current one. Without the date the
+      // header is indistinguishable from the live balances, and a stale number
+      // that looks live is worse than no number at all.
+      `<span class="ecd-d-asof">${asOf ? 'as of ' + escapeHtml(asOf) : ''}</span>` +
       `</div>` +
       `<div class="ecd-d-sub">${subHtml(totals)}</div>` +
       chart +
@@ -2621,7 +2700,9 @@
     overflow:visible;flex:1 1 auto}
   #ecd-card .ecd-c-spark svg{display:block;width:100%;height:100%}
   #ecd-detail{font:inherit}
-  #ecd-detail .ecd-d-head{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+  #ecd-detail .ecd-d-head{display:flex;align-items:baseline;gap:12px;margin-bottom:14px}
+  /* Quiet, but present whenever the figures are historical. */
+  #ecd-detail .ecd-d-asof{font:400 12px/1.3 inherit;opacity:.55;white-space:nowrap}
   /* The title is the way back, so it says so on hover — there is no button. */
   #ecd-detail .ecd-d-title{font:700 17px/1.2 inherit;cursor:pointer}
   #ecd-detail .ecd-d-title:hover{text-decoration:underline;text-underline-offset:3px}
