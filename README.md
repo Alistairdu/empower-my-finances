@@ -198,12 +198,30 @@ Each account's balance for a day now comes from one of three places, in order
 of authority:
 
 1. **What it reported that day** — including a live balance, per above.
-2. **What the dated transactions say it must have been**, across a gap whose two
-   ends both reported and whose transactions add up to the difference.
+2. **What the dated transactions say it must have been**, across a window whose
+   two ends both reported and whose transactions add up to the difference.
 3. **Its last known balance, carried** — the old behaviour, now the last resort
    rather than the only option.
 
-Inside a gap that reconciles, *every* calendar day is known, not just the ones a
+**A window runs between the days the balance changed, not between the days the
+account reported.** This is the difference between the feature working and not.
+A card feed routinely republishes the same balance for days and then moves it in
+a lump when a batch of charges posts. Anchored on reports, each of those repeats
+counted as a fresh reading, so there was never a window to derive across — the
+graph ran flat through a week you had certainly spent in, the cash and cards
+figures never budged, and every transaction produced a reconciling row pointing
+the opposite way to itself. A repeated balance is one fact followed by a run of
+silences. The first day of a run is the anchor, being the last moment the figure
+is known to have been true; the last reading closes the final window even when it
+repeats, so a balance that is flat because nothing happened still accounts for
+its quiet days rather than dropping them.
+
+Where the sums prove a window, the repeated readings inside it are **overwritten**
+— that is the point of the exercise. A reading the window merely confirms is left
+alone and still counts as reported: a window that lands on the figure already
+there has confirmed a reading, not replaced it.
+
+Inside a window that reconciles, *every* calendar day is known, not just the ones a
 transaction is dated on: the balance is the earlier reading plus everything
 dated on or before that day, and the later reading proves the sum. The quiet
 days in between are the flat stretches of the graph, and they are as known as
@@ -251,6 +269,10 @@ that still looks too big explains itself rather than just looking wrong.
 ```
 node test.js
 ```
+
+It also checks that `VERSION` in `content.js` matches `manifest.json` — they
+drifted once, and a Diagnose report claiming a version that isn't running sends
+you hunting for a reload problem that doesn't exist.
 
 No dependencies, no build step, nothing to install. The series arithmetic is the
 one part of this that can be wrong without *looking* wrong — a balance graph

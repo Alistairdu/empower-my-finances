@@ -11,7 +11,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.18.0';
+  const VERSION = '0.28.0';
 
   // The same file is injected into both the page's MAIN world (where
   // `window.csrf` is reachable) and the extension's ISOLATED world (which
@@ -621,7 +621,34 @@
       const vals = new Map(m);
       const from = new Set();
       const mv = moved.get(id) || new Map();
-      const said = [...m.keys()].sort();
+
+      // Anchor on the days the balance *changed*, not the days the account
+      // reported. A repeated balance is one fact followed by a run of silences,
+      // and treating each repeat as a fresh reading is what left this broken:
+      // card feeds routinely republish the same number for days and then move
+      // it in a lump when a batch of charges posts. Anchored on reports, every
+      // one of those days had a transaction against an unmoved balance — so the
+      // graph ran flat through a week you had certainly spent in, the cash and
+      // cards figures never budged, and each day produced an "unexplained"
+      // row in the opposite direction to its own transaction.
+      //
+      // Between two days the balance genuinely moved, the transactions are the
+      // only account of what happened, and the readings at either end are what
+      // prove them. The first day of each run is the anchor, since that is the
+      // last moment the figure is known to have been true.
+      const all = [...m.keys()].sort();
+      const said = [];
+      let prev = null;
+      for (const d of all) {
+        if (prev === null || cents(m.get(d)) !== cents(prev)) said.push(d);
+        prev = m.get(d);
+      }
+      // The last reading closes the final window even when it repeats the one
+      // before it. Without it a balance that is flat because nothing happened —
+      // a bank over a weekend — has no closing anchor, and the quiet days it
+      // could have accounted for are dropped from the graph entirely.
+      const end = all[all.length - 1];
+      if (end && said[said.length - 1] !== end) said.push(end);
 
       for (let k = 0; haveTxns && k + 1 < said.length; k++) {
         const a = said[k];
@@ -634,16 +661,24 @@
         if (cents(total) !== cents(m.get(b) - m.get(a))) continue;
 
         // Every calendar day between the two readings, not just the ones a
-        // transaction is dated on. Inside a gap that reconciles, the balance on
-        // each day is known exactly: it is the earlier reading plus whatever is
-        // dated on or before that day, and the later reading proves the sum.
+        // transaction is dated on. Inside a window that reconciles, the balance
+        // on each day is known exactly: it is the earlier reading plus whatever
+        // is dated on or before that day, and the later reading proves the sum.
         // The quiet days in between are the flat stretches of the graph, and
         // they are as known as the days money moved.
+        //
+        // This overwrites any repeated reading inside the window, which is the
+        // point: the sums prove the feed was republishing a stale figure, and
+        // the transaction dates say when the money actually moved.
         let v = m.get(a);
         for (let d = nextDay(a); d < b; d = nextDay(d)) {
           v += mv.get(d) || 0;
+          // Only claim to have worked a day out when we actually supplied
+          // something. A window that lands on the figure already reported has
+          // confirmed a reading, not replaced it, and calling that "derived"
+          // would quietly demote a real one.
+          if (!m.has(d) || cents(m.get(d)) !== cents(v)) from.add(d);
           vals.set(d, v);
-          from.add(d);
         }
       }
       known.set(id, vals);

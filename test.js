@@ -110,6 +110,9 @@ const loaded = (list) => Object.assign(list, { from: '2026-07-01' });
 const bankRows = [];
 for (let d = 20; d <= 28; d++) bankRows.push([BANK, `2026-07-${d}`, 5000 + (d - 20) * 100]);
 const values = (s) => s.map((p) => [p.date.slice(8), p.value]);
+// selectedChange() reads the module-level selection, so set it and ask.
+const selectedChangeOn = (d) => { ctx.selFrom = ctx.selTo = d; const c = ctx.selectedChange(); ctx.selFrom = ctx.selTo = null; return c && c.delta; };
+ctx.selectedChangeOn = selectedChangeOn;
 
 // ---------------------------------------------------------------------------
 section('a card silent for a week, with transactions that reconcile');
@@ -435,9 +438,10 @@ ctx.selFrom = ctx.selTo = null;
 // ---------------------------------------------------------------------------
 section('a charge dated one day and posted another');
 // The shape that filled the list with noise: a card charge dated the 9th that
-// the bank posts on the 11th. The 9th shows a transaction against a balance
-// that hasn't moved; the 11th shows a balance that moves with no transaction
-// dated to it. Read a day at a time, one purchase makes two accusations.
+// the bank posts on the 11th, with the balance republished at 1000 in between.
+// Anchoring on balance *changes* rather than on reports now derives straight
+// through it — the charge lands on the day it was made, and there is nothing
+// left over to report at all.
 noToday();
 const postRows = [
   [BANK, '2026-07-08', 5000], [BANK, '2026-07-09', 5000], [BANK, '2026-07-10', 5000],
@@ -450,46 +454,101 @@ ctx.series = ctx.seriesFrom(hist(postRows), postTxns); ctx.residualCache = null;
 ctx.txns = postTxns;
 ctx.seriesRev = (ctx.seriesRev || 0) + 1;
 
-const charged = ctx.reconcile('2026-07-09', '2026-07-09');
-eq('the charge day is one row, not an accusation', charged.length, 1);
-eq('...marked as still settling', charged[0].kind, 'settling');
-eq('...naming the day it lands', charged[0].when, '2026-07-11');
-eq('...for the amount the list runs ahead by', charged[0].amount, 134);
+eq('the charge lands on the day it was made',
+  values(ctx.series),
+  [['08', 4000], ['09', 3866], ['10', 3866], ['11', 3866], ['12', 3866]]);
+for (const d of ['2026-07-09', '2026-07-10', '2026-07-11']) {
+  eq(`${d}: no row at all`, ctx.reconcile(d, d), []);
+}
 
-const posted = ctx.reconcile('2026-07-11', '2026-07-11');
-eq('the posting day is the other half', [posted[0].kind, posted[0].amount], ['settling', -134]);
-eq('...pointing back at the charge date', posted[0].when, '2026-07-09');
-
-// Over a span holding both days there is nothing to report at all: the two
-// halves are one purchase, and it is already in the list.
-eq('a span covering both is silent', ctx.reconcile('2026-07-09', '2026-07-12'), []);
-eq('a day with neither is silent too', ctx.reconcile('2026-07-10', '2026-07-10'), []);
-
-// A genuine discrepancy still gets through: a 9 fee on the 12th with nothing
-// behind it and nothing within the settle window to cancel against.
-const feeRows = postRows.map((r) =>
-  r[0] === CARD && r[1] >= '2026-07-12' ? [r[0], r[1], r[2] + 9] : r
-);
-ctx.series = ctx.seriesFrom(hist(feeRows), postTxns); ctx.residualCache = null;
+// The matcher still earns its keep where deriving can't reach: a balance that
+// moves *before* its transaction row appears. There is no closing reading to
+// prove the window, so the two halves are left as residuals — and paired.
+const lateRows = [
+  [BANK, '2026-07-08', 5000], [BANK, '2026-07-09', 5000], [BANK, '2026-07-10', 5000],
+  [BANK, '2026-07-11', 5000], [BANK, '2026-07-12', 5000],
+  [CARD, '2026-07-08', 1000], [CARD, '2026-07-09', 1000], [CARD, '2026-07-10', 1134],
+  [CARD, '2026-07-11', 1134], [CARD, '2026-07-12', 1134],
+];
+const lateTxns = loaded([txn(CARD, '2026-07-12', -134)]);
+ctx.series = ctx.seriesFrom(hist(lateRows), lateTxns); ctx.residualCache = null;
+ctx.txns = lateTxns;
 ctx.seriesRev++;
-eq('the settling pair is still recognised',
-  ctx.reconcile('2026-07-11', '2026-07-11').map((g) => [g.kind, g.amount]), [['settling', -134]]);
-eq('and the fee is called out on its own day',
-  ctx.reconcile('2026-07-12', '2026-07-12').map((g) => [g.kind, g.amount]), [['unexplained', -9]]);
-eq('over the pair of days, only the fee survives',
-  ctx.reconcile('2026-07-09', '2026-07-12').map((g) => [g.kind, g.amount]), [['unexplained', -9]]);
 
-// Matching is on exact magnitude, so a fee landing on the very day a charge
-// posts merges with it and the pair is no longer recognisable. Both then read
-// as unexplained, which is the safe direction to fail in: it over-reports
-// rather than quietly swallowing a real difference.
-const sameDay = postRows.map((r) =>
+const moved = ctx.reconcile('2026-07-10', '2026-07-10');
+eq('the day the balance moved is marked settling',
+  [moved[0].kind, moved[0].amount], ['settling', -134]);
+eq('...pointing at the day the row is dated', moved[0].when, '2026-07-12');
+eq('the day the row appears is the other half',
+  ctx.reconcile('2026-07-12', '2026-07-12').map((g) => [g.kind, g.amount]), [['settling', 134]]);
+eq('a span covering both is silent', ctx.reconcile('2026-07-09', '2026-07-12'), []);
+
+// A genuine discrepancy still gets through: a 9 fee with nothing behind it and
+// nothing within the settle window to cancel against.
+const feeRows = lateRows.map((r) =>
   r[0] === CARD && r[1] >= '2026-07-11' ? [r[0], r[1], r[2] + 9] : r
 );
-ctx.series = ctx.seriesFrom(hist(sameDay), postTxns); ctx.residualCache = null;
+ctx.series = ctx.seriesFrom(hist(feeRows), lateTxns); ctx.residualCache = null;
 ctx.seriesRev++;
-eq('a fee on the posting day hides the pair',
-  ctx.reconcile('2026-07-11', '2026-07-11').map((g) => [g.kind, g.amount]), [['unexplained', -143]]);
+eq('the fee is called out on its own day',
+  ctx.reconcile('2026-07-11', '2026-07-11').map((g) => [g.kind, g.amount]), [['unexplained', -9]]);
+eq('and the settling pair survives beside it',
+  ctx.reconcile('2026-07-10', '2026-07-10').map((g) => [g.kind, g.amount]), [['settling', -134]]);
+
+// ---------------------------------------------------------------------------
+section('a feed that republishes the same balance for days');
+// What a card actually does: report 1000 owed every day while charges are made,
+// then move in a lump when the batch posts. Anchored on days the account
+// *reported*, every one of those days had a transaction against an unmoved
+// balance — so nothing derived, the figures never budged, and each day produced
+// an unexplained row pointing the opposite way to its own transaction.
+noToday();
+const staleRows = [
+  [BANK, '2026-07-08', 5000], [BANK, '2026-07-09', 5000], [BANK, '2026-07-10', 5000],
+  [BANK, '2026-07-11', 5000], [BANK, '2026-07-12', 5000],
+  [CARD, '2026-07-08', 1000], [CARD, '2026-07-09', 1000], [CARD, '2026-07-10', 1000],
+  [CARD, '2026-07-11', 1000], [CARD, '2026-07-12', 1360],
+];
+// Three charges over three days, posting together on the 12th.
+const staleTxns = loaded([
+  txn(CARD, '2026-07-09', -134),
+  txn(CARD, '2026-07-10', -86),
+  txn(CARD, '2026-07-11', -140),
+]);
+ctx.series = ctx.seriesFrom(hist(staleRows), staleTxns); ctx.residualCache = null;
+ctx.txns = staleTxns;
+ctx.seriesRev++;
+
+eq('the graph moves on the days money moved',
+  values(ctx.series),
+  [['08', 4000], ['09', 3866], ['10', 3780], ['11', 3640], ['12', 3640]]);
+eq('the cards figure moves day to day',
+  ctx.series.map((p) => ctx.totalsAt(p).CREDIT_CARD), [1000, 1134, 1220, 1360, 1360]);
+eq('the repeated readings are marked derived, not reported',
+  [ctx.series[1].fresh, ctx.series[1].derived], [1, 1]);
+
+// And the rows that started all this are gone.
+for (const d of ['2026-07-09', '2026-07-10', '2026-07-11', '2026-07-12']) {
+  eq(`${d}: nothing left to reconcile`, ctx.reconcile(d, d), []);
+}
+eq('the day figure is the charge made that day', ctx.txnNet('2026-07-09', '2026-07-09').sum, -134);
+eq('...and matches the balance movement', ctx.selectedChangeOn('2026-07-09'), -134);
+
+// A window whose transactions do not add up is still refused, so a stale
+// reading is only overwritten where the sums prove it was stale.
+const unprovable = loaded([txn(CARD, '2026-07-09', -134)]);
+ctx.series = ctx.seriesFrom(hist(staleRows), unprovable); ctx.residualCache = null;
+eq('an unproven window keeps the reported figures',
+  values(ctx.series),
+  [['08', 4000], ['09', 4000], ['10', 4000], ['11', 4000], ['12', 3640]]);
+
+// ---------------------------------------------------------------------------
+section('the reported version is the shipped version');
+const manifestVersion = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8')
+).version;
+const codeVersion = (src.match(/const VERSION = '([^']+)'/) || [])[1];
+eq('content.js agrees with manifest.json', codeVersion, manifestVersion);
 
 // ---------------------------------------------------------------------------
 section('finding a posting date, if the payload has one');
