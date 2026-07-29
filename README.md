@@ -388,8 +388,24 @@ accusations in opposite directions — the charge day shows a transaction agains
 a balance that hasn't moved, and the posting day shows a balance that moves with
 no transaction dated to it. On a card in daily use that was most of the list.
 
-So residuals are computed per account for every day of the series and then
-**matched against each other**: equal magnitude, opposite sign, same account,
+**If the payload ships a posting date, that is used instead** and the problem
+doesn't arise. `postedDay()` tries the known spellings — `postedDate`,
+`postDate`, `settleDate` and friends — then anything else whose name looks like
+one, the same tolerance the history parsing has and for the same reason: field
+names move between builds. A candidate is only accepted if it parses to a date
+that is on or after the charge and no more than `POST_MAX_LAG` (30) days later,
+so a field named like a posting date but holding something else falls back
+rather than corrupting every comparison. Diagnose reports which field was used
+under `txnProbe.postingDateField`, or says none was found.
+
+Everything that compares transactions to balances goes through `balanceDay()` —
+the series derivation, the residuals, the day figure, and the list's own day
+filter — so selecting a day on the graph lists what moved the balance *that*
+day. Rows still show the date you'd recognise, the day the charge was made, and
+say `Charged 2026-07-09, posted 2026-07-11` on hover when the two differ.
+
+Where there is no posting date, residuals are computed per account for every day
+of the series and then **matched against each other**: equal magnitude, opposite sign, same account,
 within `SETTLE_DAYS` (6), one to one — the same shape as `markPairs()`. A matched
 pair reads `Still settling — reaches the balance 2026-07-11` on one side and
 `Settled here — dated 2026-07-09` on the other, greyed, with nothing to chase.

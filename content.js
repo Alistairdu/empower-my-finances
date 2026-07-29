@@ -329,6 +329,14 @@
     return isFinite(t) ? ymd(t) : '';
   }
 
+  // The day a transaction moved a balance, as against the day it was made.
+  //
+  // Everything that compares transactions to balances has to use this one: the
+  // balance moves when the bank posts the charge, not when you made it. Falls
+  // back to the transaction date, which is what builds that don't ship a
+  // posting date leave us with.
+  const balanceDay = (t) => t.postDay || t.day;
+
   // Nearest series point to a day, so a selection survives the history being
   // refetched with slightly different coverage.
   function indexOfDay(series, day) {
@@ -597,10 +605,11 @@
     const txnFrom = (movements && movements.from) || '';
     const moved = new Map(); // id → Map(day → summed amount)
     for (const t of movements || []) {
-      if (!t || !t.day || !isFinite(t.amount) || !perAcct.has(t.acctId)) continue;
+      const td = balanceDay(t);
+      if (!t || !td || !isFinite(t.amount) || !perAcct.has(t.acctId)) continue;
       if (!moved.has(t.acctId)) moved.set(t.acctId, new Map());
       const m = moved.get(t.acctId);
-      m.set(t.day, (m.get(t.day) || 0) + t.amount);
+      m.set(td, (m.get(td) || 0) + t.amount);
     }
 
     const cents = (n) => Math.round(n * 100);
@@ -754,6 +763,41 @@
     );
   }
 
+  // Spellings a posting date might arrive under. Tried in order, and anything
+  // else whose name looks like one is tried after — the same tolerance the
+  // history parsing has, for the same reason: field names move between builds.
+  const POST_KEYS = [
+    'postedDate', 'postDate', 'posted', 'postedOn',
+    'settleDate', 'settlementDate', 'clearedDate', 'transactionPostedDate',
+  ];
+
+  // How far a posting may plausibly trail the charge. Beyond this it isn't a
+  // posting date, it's some other field that happens to be named like one.
+  const POST_MAX_LAG = 30;
+
+  let postKeyUsed = '';
+
+  function postedDay(t, day) {
+    if (!day) return '';
+    const keys = POST_KEYS.concat(
+      Object.keys(t).filter((k) => /post|settl|clear/i.test(k) && !POST_KEYS.includes(k))
+    );
+    for (const k of keys) {
+      const v = t[k];
+      if (v === undefined || v === null || v === '' || typeof v === 'object') continue;
+      const d = dayKey(v);
+      if (!d) continue;
+      // A posting before the charge is not a posting. Guarding both ends means
+      // a misidentified field falls back rather than corrupting every
+      // comparison the reconciliation makes.
+      const lag = Math.round((Date.parse(d) - Date.parse(day)) / DAY_MS);
+      if (!isFinite(lag) || lag < 0 || lag > POST_MAX_LAG) continue;
+      postKeyUsed = k;
+      return d;
+    }
+    return '';
+  }
+
   async function fetchTransactions(days) {
     const ids = cashAccountIds();
     if (!ids.length) throw new Error('no cash or credit card accounts found');
@@ -764,27 +808,20 @@
       userAccountIds: JSON.stringify(ids),
     });
     const rows = (json && json.spData && json.spData.transactions) || [];
-    // Which date fields a transaction actually carries. We key off
-    // transactionDate — when the charge was made — while balances move on the
-    // day it posts. If a build ships a posting date too, that is the one the
-    // reconciliation wants, and this is how we would find out.
-    txnProbe = {
-      count: rows.length,
-      fields: [...new Set(rows.slice(0, 40).flatMap((r) => Object.keys(r || {})))],
-      dateish: Object.fromEntries(
-        Object.entries(rows[0] || {}).filter(
-          ([k, v]) => /date|post|pending|status/i.test(k) && typeof v !== 'object'
-        )
-      ),
-    };
+    postKeyUsed = '';
     const typeById = accountTypeById();
     const out = rows
       .map((t) => {
         const amt = Number(t.amount);
         const acctId = String(t.userAccountId ?? t.accountId ?? t.accountName ?? '');
+        const day = dayKey(t.transactionDate || t.date || '');
         return {
           date: t.transactionDate || t.date || '',
-          day: dayKey(t.transactionDate || t.date || ''),
+          day,
+          // Empty unless a posting date is both present and plausible, so
+          // balanceDay() falls back to the transaction date on builds that
+          // don't ship one.
+          postDay: postedDay(t, day),
           desc: t.description || t.originalDescription || t.merchant || '',
           account: t.accountName || '',
           acctId,
@@ -804,6 +841,19 @@
     // The window asked for, so the series knows how far back the *absence* of
     // a transaction is evidence of anything.
     out.from = from;
+    // What the payload actually offered, recorded after the mapping so it can
+    // say which field was used rather than which fields exist.
+    txnProbe = {
+      count: rows.length,
+      postingDateField: postKeyUsed || 'none found — using transactionDate',
+      posted: out.filter((t) => t.postDay && t.postDay !== t.day).length,
+      fields: [...new Set(rows.slice(0, 40).flatMap((r) => Object.keys(r || {})))],
+      dateish: Object.fromEntries(
+        Object.entries(rows[0] || {}).filter(
+          ([k, v]) => /date|post|pending|status/i.test(k) && typeof v !== 'object'
+        )
+      ),
+    };
     markPairs(out);
     return out;
   }
@@ -1585,7 +1635,8 @@
     let sum = 0;
     let n = 0;
     for (const t of txns) {
-      if (!t.day || t.day < from || t.day > to) continue;
+      const d = balanceDay(t);
+      if (!d || d < from || d > to) continue;
       sum += t.amount;
       n++;
     }
@@ -1648,10 +1699,11 @@
 
     const moved = new Map();
     for (const t of txns) {
-      if (!t.day || !isFinite(t.amount)) continue;
+      const d = balanceDay(t);
+      if (!d || !isFinite(t.amount)) continue;
       if (!moved.has(t.acctId)) moved.set(t.acctId, new Map());
       const m = moved.get(t.acctId);
-      m.set(t.day, (m.get(t.day) || 0) + t.amount);
+      m.set(d, (m.get(d) || 0) + t.amount);
     }
 
     for (let k = 1; k < series.length; k++) {
@@ -2267,7 +2319,8 @@
     const q = txnQuery.trim().toLowerCase();
     return txns.filter((t) => {
       if (hidePaired && t.paired) return false;
-      if (selFrom && (t.day < selFrom || t.day > selTo)) return false;
+      const d = balanceDay(t);
+      if (selFrom && (d < selFrom || d > selTo)) return false;
       if (!q) return true;
       return (t.desc + ' ' + t.account).toLowerCase().includes(q);
     });
@@ -2328,7 +2381,15 @@
               ? ' class="ecd-d-pair" title="Both sides of this movement are in ' +
                 'the list — together they net to zero"'
               : ''
-          }><td class="ecd-d-date">${escapeHtml(t.date)}</td>` +
+          }><td class="ecd-d-date"${
+            // The row is dated when the charge was made, which is what you'd
+            // recognise; everything measured against a balance uses the day it
+            // posted. Where they differ, say so rather than leaving the list
+            // looking a day out of step with the graph it sits under.
+            t.postDay && t.postDay !== t.day
+              ? ` title="Charged ${escapeHtml(t.day)}, posted ${escapeHtml(t.postDay)}"`
+              : ''
+          }>${escapeHtml(t.date)}</td>` +
           `<td>${escapeHtml(t.desc)}</td>` +
           `<td class="ecd-d-acct">${escapeHtml(t.account)}</td>` +
           `<td class="ecd-d-amt ${t.amount < 0 ? 'ecd-d-out' : 'ecd-d-in'}">${signed(t.amount)}</td></tr>`

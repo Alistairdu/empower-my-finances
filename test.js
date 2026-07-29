@@ -40,7 +40,7 @@ function grabConst(name) {
 const names = [
   'seriesFrom', 'flattenHistory', 'accountTypeById', 'changeAt', 'chartChange',
   'lastChange', 'selectedChange', 'txnNet', 'reconcile', 'reconciledSpan',
-  'accountNames', 'lastReported', 'totalsAt', 'residuals', 'indexOfDay', 'dayKey', 'isLive', 'normalise',
+  'accountNames', 'lastReported', 'totalsAt', 'residuals', 'postedDay', 'indexOfDay', 'dayKey', 'isLive', 'normalise',
 ];
 
 const ctx = {
@@ -51,6 +51,7 @@ const ctx = {
   seriesRev: 0,
   residualCache: null,
   residualKey: '',
+  postKeyUsed: '',
   txns: null,
   selFrom: null,
   selTo: null,
@@ -58,7 +59,7 @@ const ctx = {
 };
 // Function declarations become properties of the context; `const` bindings are
 // lexical and don't, so they are handed out explicitly.
-const consts = ['ymd', 'shiftDay', 'todayLocal', 'SETTLE_DAYS'];
+const consts = ['ymd', 'shiftDay', 'todayLocal', 'balanceDay', 'SETTLE_DAYS', 'POST_KEYS', 'POST_MAX_LAG'];
 const expose = consts.map((n) => `globalThis.${n} = ${n};`).join('\n');
 vm.createContext(ctx);
 vm.runInContext(
@@ -489,6 +490,41 @@ ctx.series = ctx.seriesFrom(hist(sameDay), postTxns); ctx.residualCache = null;
 ctx.seriesRev++;
 eq('a fee on the posting day hides the pair',
   ctx.reconcile('2026-07-11', '2026-07-11').map((g) => [g.kind, g.amount]), [['unexplained', -143]]);
+
+// ---------------------------------------------------------------------------
+section('finding a posting date, if the payload has one');
+eq('the usual spelling', ctx.postedDay({ postedDate: '2026-07-11' }, '2026-07-09'), '2026-07-11');
+eq('another spelling', ctx.postedDay({ settleDate: '2026-07-11' }, '2026-07-09'), '2026-07-11');
+eq('a field named like one we did not list',
+  ctx.postedDay({ someClearedOn: '2026-07-11' }, '2026-07-09'), '2026-07-11');
+eq('posting on the day of the charge', ctx.postedDay({ postDate: '2026-07-09' }, '2026-07-09'), '2026-07-09');
+eq('no such field', ctx.postedDay({ transactionDate: '2026-07-09' }, '2026-07-09'), '');
+
+// A field can be named like a posting date and be something else entirely.
+// Guarding both ends means a wrong guess falls back rather than corrupting
+// every comparison the reconciliation makes.
+eq('a date before the charge is not a posting',
+  ctx.postedDay({ postedDate: '2026-07-01' }, '2026-07-09'), '');
+eq('nor is one a year later',
+  ctx.postedDay({ postedDate: '2027-07-11' }, '2026-07-09'), '');
+eq('nor is a non-date', ctx.postedDay({ postedDate: 'PENDING' }, '2026-07-09'), '');
+eq('and nothing is found without a charge date', ctx.postedDay({ postedDate: '2026-07-11' }, ''), '');
+
+// With posting dates present, the charge lands on the day the balance moved
+// and there is nothing left to reconcile at all.
+noToday();
+const withPost = loaded([
+  { ...txn(CARD, '2026-07-09', -134), postDay: '2026-07-11' },
+]);
+eq('balanceDay prefers the posting date', ctx.balanceDay(withPost[0]), '2026-07-11');
+ctx.series = ctx.seriesFrom(hist(postRows), withPost); ctx.residualCache = null;
+ctx.txns = withPost;
+ctx.seriesRev++;
+eq('nothing to reconcile on the charge day', ctx.reconcile('2026-07-09', '2026-07-09'), []);
+eq('nor on the posting day', ctx.reconcile('2026-07-11', '2026-07-11'), []);
+eq('and the day figure lands where the balance moved',
+  ctx.txnNet('2026-07-11', '2026-07-11').sum, -134);
+eq('...not on the day it was charged', ctx.txnNet('2026-07-09', '2026-07-09').sum, 0);
 
 // ---------------------------------------------------------------------------
 section('the cash and cards figures at the end of a selected span');
