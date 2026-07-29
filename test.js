@@ -40,7 +40,7 @@ function grabConst(name) {
 const names = [
   'seriesFrom', 'flattenHistory', 'accountTypeById', 'changeAt', 'chartChange',
   'lastChange', 'selectedChange', 'txnNet', 'reconcile', 'reconciledSpan',
-  'accountNames', 'lastReported', 'totalsAt', 'indexOfDay', 'dayKey', 'isLive', 'normalise',
+  'accountNames', 'lastReported', 'totalsAt', 'residuals', 'indexOfDay', 'dayKey', 'isLive', 'normalise',
 ];
 
 const ctx = {
@@ -48,6 +48,9 @@ const ctx = {
   LIABILITIES: new Set(['CREDIT_CARD', 'LOAN', 'MORTGAGE']),
   rawAccounts: [],
   series: null,
+  seriesRev: 0,
+  residualCache: null,
+  residualKey: '',
   txns: null,
   selFrom: null,
   selTo: null,
@@ -55,7 +58,7 @@ const ctx = {
 };
 // Function declarations become properties of the context; `const` bindings are
 // lexical and don't, so they are handed out explicitly.
-const consts = ['ymd', 'shiftDay', 'todayLocal'];
+const consts = ['ymd', 'shiftDay', 'todayLocal', 'SETTLE_DAYS'];
 const expose = consts.map((n) => `globalThis.${n} = ${n};`).join('\n');
 vm.createContext(ctx);
 vm.runInContext(
@@ -116,13 +119,13 @@ const rows = [...bankRows, [CARD, '2026-07-20', 2000], [CARD, '2026-07-28', 2600
 const spend = loaded([txn(CARD, '2026-07-22', -200), txn(CARD, '2026-07-25', -400)]);
 
 const before = ctx.seriesFrom(hist(rows), null);
-ctx.series = before;
+ctx.series = before; ctx.residualCache = null;
 eq('without transactions, the week lands on one day', ctx.lastChange().delta, -500);
 eq('...and the 27th is flat all week', values(before).slice(1, 8).map((v) => v[1]),
   [3100, 3200, 3300, 3400, 3500, 3600, 3700]);
 
 const after = ctx.seriesFrom(hist(rows), spend);
-ctx.series = after;
+ctx.series = after; ctx.residualCache = null;
 eq('spending lands on the days it happened', values(after),
   [['20', 3000], ['21', 3100], ['22', 3000], ['23', 3100], ['24', 3200],
    ['25', 2900], ['26', 3000], ['27', 3100], ['28', 3200]]);
@@ -141,7 +144,7 @@ section('a gap the transactions do not account for');
 // gap would mean inventing the other 50, so it carries as before.
 const short = [...bankRows, [CARD, '2026-07-20', 2000], [CARD, '2026-07-28', 2650]];
 const s2 = ctx.seriesFrom(hist(short), spend);
-ctx.series = s2;
+ctx.series = s2; ctx.residualCache = null;
 eq('unreconciled gap carries', values(s2).slice(1, 8).map((v) => v[1]),
   [3100, 3200, 3300, 3400, 3500, 3600, 3700]);
 eq('and says an account was carried', [s2[4].fresh, s2[4].derived, s2[4].of], [1, 0, 2]);
@@ -160,7 +163,7 @@ const wk = [
 ];
 const weekend = loaded([txn(CARD, '2026-07-25', -300)]);
 const s3 = ctx.seriesFrom(hist(wk), weekend);
-ctx.series = s3;
+ctx.series = s3; ctx.residualCache = null;
 eq('the weekend gets a point of its own', values(s3),
   [['24', 4000], ['25', 3700], ['26', 3700], ['27', 3700]]);
 eq('Saturday is a real 1-day step', ctx.changeAt(s3[0], s3[1]).days, 1);
@@ -201,7 +204,7 @@ setToday('2026-07-28');
 accounts[0].balance = 5900;
 accounts[1].balance = 2650;
 const s5 = ctx.seriesFrom(hist(rows), spend);
-ctx.series = s5;
+ctx.series = s5; ctx.residualCache = null;
 eq('today takes the live balances over history', s5[s5.length - 1].value, 5900 - 2650);
 eq('today is flagged live', s5[s5.length - 1].live, true);
 eq('earlier days are not', s5[0].live, false);
@@ -248,7 +251,7 @@ eq('and carries the bank into it', s9[0].value, 1000 - 200);
 // ---------------------------------------------------------------------------
 section('selection-driven change');
 noToday();
-ctx.series = ctx.seriesFrom(hist(rows), spend);
+ctx.series = ctx.seriesFrom(hist(rows), spend); ctx.residualCache = null;
 ctx.selFrom = ctx.selTo = null;
 eq('no selection, no figure', ctx.selectedChange(), null);
 
@@ -305,7 +308,7 @@ const dailyTxns = loaded([
   txn(BANK, '2026-07-23', -500),
   txn(CARD, '2026-07-23', 500),
 ]);
-ctx.series = ctx.seriesFrom(hist(dailyRows), dailyTxns);
+ctx.series = ctx.seriesFrom(hist(dailyRows), dailyTxns); ctx.residualCache = null;
 ctx.txns = dailyTxns;
 eq('net cash by day', values(ctx.series),
   [['20', 4000], ['21', 3800], ['22', 3500], ['23', 3500], ['24', 3500]]);
@@ -347,18 +350,15 @@ const driftRows = [
   [CARD, '2026-07-20', 1000], [CARD, '2026-07-21', 1000], [CARD, '2026-07-22', 1312],
   [CARD, '2026-07-23', 812], [CARD, '2026-07-24', 812],
 ];
-ctx.series = ctx.seriesFrom(hist(driftRows), dailyTxns);
+ctx.series = ctx.seriesFrom(hist(driftRows), dailyTxns); ctx.residualCache = null;
 ctx.txns = dailyTxns;
 
 eq('the interest is attributed to the bank, by name',
   ctx.reconcile('2026-07-24', '2026-07-24'),
-  [{ id: '1', name: 'Checking', amount: 5, stale: false, since: '' }]);
+  [{ id: '1', name: 'Checking', amount: 5, kind: 'unexplained', when: '' }]);
 eq('the card fee is attributed to the card',
   ctx.reconcile('2026-07-22', '2026-07-22'),
-  [{ id: '2', name: 'Blue Card', amount: -12, stale: false, since: '' }]);
-// Both accounts reported on both days, so this is money, not reporting.
-eq('a reporting account yields a real discrepancy',
-  ctx.reconcile('2026-07-24', '2026-07-24')[0].stale, false);
+  [{ id: '2', name: 'Blue Card', amount: -12, kind: 'unexplained', when: '' }]);
 eq('over the whole week, both show up biggest first',
   ctx.reconcile('2026-07-21', '2026-07-24').map((g) => [g.name, g.amount]),
   [['Blue Card', -12], ['Checking', 5]]);
@@ -399,7 +399,7 @@ section('an account that has gone quiet is not an account with a discrepancy');
 // looks like unexplained money, and the whole silence lands on the 28th.
 noToday();
 const quietRows = [...bankRows, [CARD, '2026-07-20', 2000], [CARD, '2026-07-28', 2650]];
-ctx.series = ctx.seriesFrom(hist(quietRows), spend);
+ctx.series = ctx.seriesFrom(hist(quietRows), spend); ctx.residualCache = null;
 ctx.txns = spend;
 eq('the gap did not reconcile, so the card is carried',
   ctx.series[5].held.has('2'), true);
@@ -408,19 +408,19 @@ eq('the bank reported, so it is not', ctx.series[5].held.has('1'), false);
 // The 25th: a 400 purchase the card's balance knows nothing about yet.
 const quiet = ctx.reconcile('2026-07-25', '2026-07-25');
 eq('the day of a purchase during the silence', [quiet[0].name, quiet[0].amount], ['Blue Card', 400]);
-eq('...is reported as a balance that has not caught up', quiet[0].stale, true);
-eq('...naming when the account last spoke', quiet[0].since, '2026-07-20');
+eq('...is reported as a balance that has not caught up', quiet[0].kind, 'stale');
+eq('...naming when the account last spoke', quiet[0].when, '2026-07-20');
 
 // The 28th: the balance finally arrives, carrying the whole week at once.
 const resumed = ctx.reconcile('2026-07-28', '2026-07-28');
 eq('the day it resumes carries the whole silence', resumed[0].amount, -650);
-eq('...and is still a reporting story, not a money one', resumed[0].stale, true);
+eq('...and is still a reporting story, not a money one', resumed[0].kind, 'stale');
 
 // Across the whole silence, both ends reported, so what is left is the real
 // 50 that no transaction accounts for.
 const whole = ctx.reconcile('2026-07-21', '2026-07-28');
 eq('end to end, only the genuine shortfall remains',
-  whole.filter((g) => g.id === '2').map((g) => [g.amount, g.stale]), [[-50, false]]);
+  whole.filter((g) => g.id === '2').map((g) => [g.amount, g.kind]), [[-50, 'unexplained']]);
 
 // The invariant holds throughout: listed plus reconciling equals the balances.
 for (const [a, b] of [['2026-07-25', '2026-07-25'], ['2026-07-28', '2026-07-28'], ['2026-07-21', '2026-07-28']]) {
@@ -432,9 +432,68 @@ for (const [a, b] of [['2026-07-25', '2026-07-25'], ['2026-07-28', '2026-07-28']
 ctx.selFrom = ctx.selTo = null;
 
 // ---------------------------------------------------------------------------
+section('a charge dated one day and posted another');
+// The shape that filled the list with noise: a card charge dated the 9th that
+// the bank posts on the 11th. The 9th shows a transaction against a balance
+// that hasn't moved; the 11th shows a balance that moves with no transaction
+// dated to it. Read a day at a time, one purchase makes two accusations.
+noToday();
+const postRows = [
+  [BANK, '2026-07-08', 5000], [BANK, '2026-07-09', 5000], [BANK, '2026-07-10', 5000],
+  [BANK, '2026-07-11', 5000], [BANK, '2026-07-12', 5000],
+  [CARD, '2026-07-08', 1000], [CARD, '2026-07-09', 1000], [CARD, '2026-07-10', 1000],
+  [CARD, '2026-07-11', 1134], [CARD, '2026-07-12', 1134],
+];
+const postTxns = loaded([txn(CARD, '2026-07-09', -134)]);
+ctx.series = ctx.seriesFrom(hist(postRows), postTxns); ctx.residualCache = null;
+ctx.txns = postTxns;
+ctx.seriesRev = (ctx.seriesRev || 0) + 1;
+
+const charged = ctx.reconcile('2026-07-09', '2026-07-09');
+eq('the charge day is one row, not an accusation', charged.length, 1);
+eq('...marked as still settling', charged[0].kind, 'settling');
+eq('...naming the day it lands', charged[0].when, '2026-07-11');
+eq('...for the amount the list runs ahead by', charged[0].amount, 134);
+
+const posted = ctx.reconcile('2026-07-11', '2026-07-11');
+eq('the posting day is the other half', [posted[0].kind, posted[0].amount], ['settling', -134]);
+eq('...pointing back at the charge date', posted[0].when, '2026-07-09');
+
+// Over a span holding both days there is nothing to report at all: the two
+// halves are one purchase, and it is already in the list.
+eq('a span covering both is silent', ctx.reconcile('2026-07-09', '2026-07-12'), []);
+eq('a day with neither is silent too', ctx.reconcile('2026-07-10', '2026-07-10'), []);
+
+// A genuine discrepancy still gets through: a 9 fee on the 12th with nothing
+// behind it and nothing within the settle window to cancel against.
+const feeRows = postRows.map((r) =>
+  r[0] === CARD && r[1] >= '2026-07-12' ? [r[0], r[1], r[2] + 9] : r
+);
+ctx.series = ctx.seriesFrom(hist(feeRows), postTxns); ctx.residualCache = null;
+ctx.seriesRev++;
+eq('the settling pair is still recognised',
+  ctx.reconcile('2026-07-11', '2026-07-11').map((g) => [g.kind, g.amount]), [['settling', -134]]);
+eq('and the fee is called out on its own day',
+  ctx.reconcile('2026-07-12', '2026-07-12').map((g) => [g.kind, g.amount]), [['unexplained', -9]]);
+eq('over the pair of days, only the fee survives',
+  ctx.reconcile('2026-07-09', '2026-07-12').map((g) => [g.kind, g.amount]), [['unexplained', -9]]);
+
+// Matching is on exact magnitude, so a fee landing on the very day a charge
+// posts merges with it and the pair is no longer recognisable. Both then read
+// as unexplained, which is the safe direction to fail in: it over-reports
+// rather than quietly swallowing a real difference.
+const sameDay = postRows.map((r) =>
+  r[0] === CARD && r[1] >= '2026-07-11' ? [r[0], r[1], r[2] + 9] : r
+);
+ctx.series = ctx.seriesFrom(hist(sameDay), postTxns); ctx.residualCache = null;
+ctx.seriesRev++;
+eq('a fee on the posting day hides the pair',
+  ctx.reconcile('2026-07-11', '2026-07-11').map((g) => [g.kind, g.amount]), [['unexplained', -143]]);
+
+// ---------------------------------------------------------------------------
 section('the cash and cards figures at the end of a selected span');
 noToday();
-ctx.series = ctx.seriesFrom(hist(rows), spend);
+ctx.series = ctx.seriesFrom(hist(rows), spend); ctx.residualCache = null;
 // The 25th: bank at 5500, card at 2600 owed after both purchases.
 eq('subtotals as they stood that day',
   ctx.totalsAt(ctx.series[5]), { BANK: 5500, CREDIT_CARD: 2600 });

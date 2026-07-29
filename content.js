@@ -707,6 +707,7 @@
   ];
 
   let historyProbe = null;
+  let txnProbe = null;
 
   async function fetchSeries(days) {
     const ids = cashAccountIds();
@@ -763,6 +764,19 @@
       userAccountIds: JSON.stringify(ids),
     });
     const rows = (json && json.spData && json.spData.transactions) || [];
+    // Which date fields a transaction actually carries. We key off
+    // transactionDate — when the charge was made — while balances move on the
+    // day it posts. If a build ships a posting date too, that is the one the
+    // reconciliation wants, and this is how we would find out.
+    txnProbe = {
+      count: rows.length,
+      fields: [...new Set(rows.slice(0, 40).flatMap((r) => Object.keys(r || {})))],
+      dateish: Object.fromEntries(
+        Object.entries(rows[0] || {}).filter(
+          ([k, v]) => /date|post|pending|status/i.test(k) && typeof v !== 'object'
+        )
+      ),
+    };
     const typeById = accountTypeById();
     const out = rows
       .map((t) => {
@@ -1602,48 +1616,128 @@
   // Measured from the point *before* the first day, so the first day's own
   // movement is inside the span — the same rule the change figure uses, so the
   // two agree.
+  // How long a charge may take to reach the balance. A card transaction is
+  // dated when you made it and moves the balance when the bank posts it, which
+  // on a credit card is routinely a day or three later, and longer over a
+  // weekend.
+  const SETTLE_DAYS = 6;
+
+  // The per-account, per-day difference between what the balance did and what
+  // the transactions dated that day come to — and, where one difference is
+  // explained by another a few days away, which one.
+  //
+  // This matching is the whole reason the function exists. A single day's
+  // difference is not evidence of anything on its own: the transaction appears
+  // on the day it was made, the balance moves on the day it posted, and those
+  // two days each look like unexplained money in opposite directions. Reported
+  // day by day that is one purchase generating two accusations, and on a card
+  // used daily it is most of the list.
+  //
+  // Matching is the same shape as markPairs(): equal magnitude, opposite sign,
+  // same account, close in time, one to one. What survives is what no timing
+  // difference can account for.
+  let residualCache = null;
+  let residualKey = '';
+
+  function residuals() {
+    const key = `${seriesRev}:${txns ? txns.length : -1}`;
+    if (residualCache && residualKey === key) return residualCache;
+    residualKey = key;
+    residualCache = new Map(); // id → Map(day → { amount, settles })
+    if (!series || series.length < 2 || !txns) return residualCache;
+
+    const moved = new Map();
+    for (const t of txns) {
+      if (!t.day || !isFinite(t.amount)) continue;
+      if (!moved.has(t.acctId)) moved.set(t.acctId, new Map());
+      const m = moved.get(t.acctId);
+      m.set(t.day, (m.get(t.day) || 0) + t.amount);
+    }
+
+    for (let k = 1; k < series.length; k++) {
+      const prevDay = dayKey(series[k - 1].date);
+      const day = dayKey(series[k].date);
+      const before = series[k - 1].parts;
+      for (const [id, after] of series[k].parts) {
+        const mv = moved.get(id);
+        let explained = 0;
+        if (mv) for (const [d, amt] of mv) if (d > prevDay && d <= day) explained += amt;
+        const was = before.has(id) ? before.get(id) : after;
+        const diff = Math.round((after - was - explained) * 100) / 100;
+        if (!diff) continue;
+        if (!residualCache.has(id)) residualCache.set(id, new Map());
+        residualCache.get(id).set(day, { amount: diff, settles: '' });
+      }
+    }
+
+    for (const byDay of residualCache.values()) {
+      const days = [...byDay.keys()].sort();
+      for (const a of days) {
+        const x = byDay.get(a);
+        if (x.settles) continue;
+        for (const b of days) {
+          const y = byDay.get(b);
+          if (b === a || y.settles) continue;
+          if (Math.abs(Date.parse(b) - Date.parse(a)) > SETTLE_DAYS * DAY_MS) continue;
+          if (Math.round((x.amount + y.amount) * 100) !== 0) continue;
+          x.settles = b;
+          y.settles = a;
+          break;
+        }
+      }
+    }
+    return residualCache;
+  }
+
   function reconcile(from, to) {
     if (!series || series.length < 2 || !txns || !from || !to) return [];
     const i = indexOfDay(series, from);
     const j = indexOfDay(series, to);
     if (i === null || j === null) return [];
     const lo = Math.min(i, j) - 1;
+    const hi = Math.max(i, j);
     if (lo < 0) return [];
-    const opening = series[lo].parts;
-    const closing = series[Math.max(i, j)].parts;
-    if (!opening || !closing) return [];
 
-    const net = new Map();
-    for (const t of txns) {
-      if (!t.day || t.day < from || t.day > to) continue;
-      net.set(t.acctId, (net.get(t.acctId) || 0) + t.amount);
-    }
+    // The span covers the steps from series[lo] to series[hi], which is every
+    // series day from lo + 1 onwards — the same days selectedChange() measures.
+    const first = dayKey(series[lo + 1].date);
+    const last = dayKey(series[hi].date);
+    const inSpan = (d) => d >= first && d <= last;
 
     const names = accountNames();
-    const openPt = series[lo];
-    const closePt = series[Math.max(i, j)];
     const out = [];
-    for (const [id, after] of closing) {
-      // An account with no opening balance hasn't moved as far as we can tell.
-      const moved = after - (opening.has(id) ? opening.get(id) : after);
-      const diff = Math.round((moved - (net.get(id) || 0)) * 100) / 100;
-      if (!diff) continue;
-      // A balance carried across one or both ends of the span isn't a
-      // statement about these days, so the difference measured against it is a
-      // statement about *reporting*, not about money. Calling that "unexplained"
-      // would be a confident accusation about an account that simply hasn't
-      // spoken — and it points the wrong way twice over: the transactions look
-      // unexplained while the account is quiet, then the whole silence lands as
-      // one lump on the day it resumes. Same number either way; only the story
-      // it tells is different, and the story is the reason for the row.
-      const stale = openPt.held.has(id) || closePt.held.has(id);
-      out.push({
-        id,
-        name: names.get(id) || 'an account',
-        amount: diff,
-        stale,
-        since: stale ? lastReported(id, Math.max(i, j)) : '',
-      });
+    for (const [id, byDay] of residuals()) {
+      // A balance carried across either end of the span isn't a statement about
+      // these days, so a difference measured against it is a statement about
+      // *reporting*, not about money. Calling that "unexplained" would be a
+      // confident accusation about an account that simply hasn't spoken.
+      const stale = series[lo].held.has(id) || series[hi].held.has(id);
+      let unexplained = 0;
+      let pending = 0;
+      let lands = '';
+      for (const [d, r] of byDay) {
+        if (!inSpan(d)) continue;
+        // Both halves inside the span: they cancel, and there is nothing to say.
+        if (r.settles && inSpan(r.settles)) continue;
+        if (r.settles) {
+          pending += r.amount;
+          if (!lands || r.settles > lands) lands = r.settles;
+        } else {
+          unexplained += r.amount;
+        }
+      }
+      const name = names.get(id) || 'an account';
+      if (stale) {
+        const amount = Math.round((unexplained + pending) * 100) / 100;
+        if (amount) {
+          out.push({ id, name, amount, kind: 'stale', when: lastReported(id, hi) });
+        }
+        continue;
+      }
+      pending = Math.round(pending * 100) / 100;
+      unexplained = Math.round(unexplained * 100) / 100;
+      if (pending) out.push({ id, name, amount: pending, kind: 'settling', when: lands });
+      if (unexplained) out.push({ id, name, amount: unexplained, kind: 'unexplained', when: '' });
     }
     // Biggest discrepancy first — that's the one worth chasing.
     return out.sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount));
@@ -2267,23 +2361,39 @@
     const when = span.from === span.to ? `on ${span.from}` : `${span.from} → ${span.to}`;
     return gaps
       .map((g) => {
-        // Two different things, and the difference is what you would do about
-        // them. Unexplained money is a reason to go and look at a statement.
-        // A balance that hasn't been reported is a reason to do nothing at all
-        // and let it catch up.
-        const what = g.stale
-          ? `Not in the balance yet — ${g.name} last reported ${g.since || 'some time ago'}`
-          : `Unexplained ${g.amount < 0 ? 'decrease' : 'increase'} — not in the transactions`;
-        const title = g.stale
-          ? `${g.name} has not reported a balance since ${g.since || 'before this span'}, ` +
+        // Three different things, and the difference is what you would do about
+        // each. Unexplained money is a reason to go and look at a statement. A
+        // charge still settling, or a balance that hasn't been reported, are
+        // both reasons to do nothing at all and let them catch up.
+        let what;
+        let title;
+        if (g.kind === 'stale') {
+          what = `Not in the balance yet — ${g.name} last reported ${g.when || 'some time ago'}`;
+          title =
+            `${g.name} has not reported a balance since ${g.when || 'before this span'}, ` +
             `so the graph doesn't show these days yet. Nothing is wrong; the figure is ` +
             `the amount by which the list runs ahead of the balance, and it will ` +
-            `disappear when the account next syncs.`
-          : `${g.name} moved ${signed(g.amount)} ${when} with no transaction to show ` +
-            `for it. Interest or a fee, a charge that has hit the balance but not ` +
-            `posted as a row yet, or a transaction Empower didn't return.`;
+            `disappear when the account next syncs.`;
+        } else if (g.kind === 'settling') {
+          const later = g.when && g.when > (span.to || '');
+          what = later
+            ? `Still settling — reaches the balance ${g.when}`
+            : `Settled here — dated ${g.when}`;
+          title =
+            `Dated one day and posted another, which is normal on a card: a charge ` +
+            `is dated when you made it and moves the balance when the bank posts ` +
+            `it. The matching movement is on ${g.when}, so over a span covering ` +
+            `both days this cancels out and no row appears. Nothing to chase.`;
+        } else {
+          what = `Unexplained ${g.amount < 0 ? 'decrease' : 'increase'} — not in the transactions`;
+          title =
+            `${g.name} moved ${signed(g.amount)} ${when} with no transaction to show ` +
+            `for it, and nothing within ${SETTLE_DAYS} days accounts for it either. ` +
+            `Interest or a fee, or a transaction Empower didn't return.`;
+        }
+        const quiet = g.kind !== 'unexplained';
         return (
-          `<tr class="ecd-d-recon${g.stale ? ' ecd-d-stale' : ''}" title="${escapeHtml(title)}">` +
+          `<tr class="ecd-d-recon${quiet ? ' ecd-d-stale' : ''}" title="${escapeHtml(title)}">` +
           `<td class="ecd-d-date"></td>` +
           `<td>${escapeHtml(what)}</td>` +
           `<td class="ecd-d-acct">${escapeHtml(g.name)}</td>` +
@@ -2602,6 +2712,7 @@
         };
       })(),
       historyProbe,
+      txnProbe,
       accountBalanceFields: accountBalanceFields(),
       cashAccountIds: cashAccountIds().length,
       anchors: CARD_PLACEMENT.map((p) => ({

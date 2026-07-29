@@ -380,6 +380,27 @@ They also appear when nothing else matches. A selected day with no transactions
 whose balance moved anyway is the case they exist for — without them the view
 would say "nothing happened" over a graph that visibly stepped.
 
+**A charge dated one day and posted another is not a discrepancy either.** This
+is the big one on a credit card: a transaction is dated when you *made* the
+charge and the balance moves when the bank *posts* it, routinely a day or three
+later and longer over a weekend. Read a day at a time, one purchase makes two
+accusations in opposite directions — the charge day shows a transaction against
+a balance that hasn't moved, and the posting day shows a balance that moves with
+no transaction dated to it. On a card in daily use that was most of the list.
+
+So residuals are computed per account for every day of the series and then
+**matched against each other**: equal magnitude, opposite sign, same account,
+within `SETTLE_DAYS` (6), one to one — the same shape as `markPairs()`. A matched
+pair reads `Still settling — reaches the balance 2026-07-11` on one side and
+`Settled here — dated 2026-07-09` on the other, greyed, with nothing to chase.
+Over any span containing both days they cancel and no row appears at all. What
+survives the matching is what no timing difference can account for.
+
+Matching is on exact magnitude, so a fee landing on the very day a charge posts
+merges with it and the pair stops being recognisable — both then read as
+unexplained. That is the safe direction to fail in: it over-reports rather than
+quietly swallowing a real difference.
+
 **An account that has gone quiet is not an account with a discrepancy.** Where a
 balance is *carried* at either end of the span — a gap the transactions couldn't
 reconcile — the difference measured against it is a statement about reporting,
