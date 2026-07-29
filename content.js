@@ -401,6 +401,65 @@
     return out;
   }
 
+  // What the history payload actually calls its balances, and anything it says
+  // about them.
+  //
+  // Nothing we read distinguishes a posted closing balance from an available
+  // one net of pending authorisations — and that difference would surface as
+  // exactly the drift the reconciling rows report. flattenHistory() takes the
+  // first field it recognises, so a row carrying both would silently lose one
+  // and never say so. This reports what was on offer instead of guessing.
+  //
+  // The annotations are the other half. flattenHistory() skips the sibling
+  // "<id>Annotation" strings because they aren't numbers, but a note attached
+  // to a balance is exactly where a provider would mark it estimated, pending
+  // or missing — so they are worth reading even though they can't be summed.
+  function balanceShape(sp) {
+    const keys = new Set();
+    const notes = new Set();
+    const roots = [sp && sp.histories, sp && sp.accountHistories, sp && sp.balances];
+    for (const rows of roots) {
+      if (!Array.isArray(rows)) continue;
+      for (const r of rows.slice(0, 60)) {
+        if (!r || typeof r !== 'object') continue;
+        for (const k of Object.keys(r)) keys.add(k);
+        const nested = r.histories || r.balances || r.dailyBalances || r.aggregates;
+        if (Array.isArray(nested)) {
+          for (const p of nested.slice(0, 5)) {
+            if (p && typeof p === 'object') for (const k of Object.keys(p)) keys.add('point.' + k);
+          }
+        } else if (nested && typeof nested === 'object') {
+          for (const k of Object.keys(nested)) {
+            if (!/Annotation$/i.test(k)) continue;
+            const v = nested[k];
+            if (v !== null && v !== undefined && v !== '') notes.add(String(v).slice(0, 60));
+          }
+        }
+      }
+    }
+    return { rowFields: [...keys], annotations: [...notes].slice(0, 12) };
+  }
+
+  // The same question of the accounts payload: which balance-ish fields an
+  // account carries, and what they say. normalise() reads `balance` and falls
+  // back to `currentBalance`; if a build also ships an available or pending
+  // figure, this is where it would show up.
+  function accountBalanceFields() {
+    const out = [];
+    for (const a of rawAccounts) {
+      if (!isLive(a) || (a.productType !== 'BANK' && a.productType !== 'CREDIT_CARD')) continue;
+      const fields = {};
+      for (const k of Object.keys(a)) {
+        if (/balance|avail|pending|cash/i.test(k) && a[k] !== null && typeof a[k] !== 'object') {
+          fields[k] = a[k];
+        }
+      }
+      out.push({ name: a.name || a.originalName || '', type: a.productType, fields });
+      if (out.length >= 8) break;
+    }
+    return out;
+  }
+
   // productType keyed by account id, for anything that arrives carrying an id
   // but no type of its own — history points and transactions both do.
   function accountTypeById() {
@@ -649,6 +708,9 @@
           sample: JSON.stringify(flattenHistory(sp)[0] || null).slice(0, 200),
           raw: JSON.stringify(sp).slice(0, 500),
           points: s.length,
+          // Raw field names, not the flattened point: `sample` is what we made
+          // of the row, so it can't show a field we dropped on the way past.
+          balanceShape: balanceShape(sp),
         });
         if (s.length) {
           historyProbe = probes;
@@ -2461,6 +2523,7 @@
         };
       })(),
       historyProbe,
+      accountBalanceFields: accountBalanceFields(),
       cashAccountIds: cashAccountIds().length,
       anchors: CARD_PLACEMENT.map((p) => ({
         text: p.text,

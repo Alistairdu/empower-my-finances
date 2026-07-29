@@ -493,6 +493,27 @@ If the panel shows an error, it also lists the API URLs the page actually
 called — that's the information needed to point it at the right host, since
 Empower's API origin varies by account.
 
+**Are these closing balances?** Nothing we read says so. `flattenHistory()`
+takes the first field it recognises — `balance`, then `value`, then
+`currentBalance`, then `amount` — and none of them is labelled posted-closing or
+available-net-of-pending. In the live payload shape the question doesn't even
+arise: `balances` is an object of one number per account per day, so there is
+nothing to choose between. If a build *does* ship both, we would silently take
+one and never know the other was there — and that difference would surface as
+exactly the drift the reconciling rows report.
+
+So Diagnose now reports the raw field names rather than the flattened point
+(which can only show what we made of a row, never a field we dropped on the way
+past): `historyProbe[].balanceShape.rowFields` lists what the history rows and
+their nested points actually carry, and `accountBalanceFields` does the same for
+the accounts payload. If either turns up an `availableBalance` next to a
+`balance`, that is the thing to switch to and the drift should shrink.
+
+`balanceShape.annotations` reads the sibling `"<id>Annotation"` strings that
+`flattenHistory()` skips. They aren't numbers so they can't be summed, but a
+note attached to a balance is exactly where a provider would mark it estimated,
+pending or missing — worth reading before concluding a figure is wrong.
+
 Two other things worth checking:
 
 - **Sign flips.** If credit cards read backwards, adjust `normalise()`.
