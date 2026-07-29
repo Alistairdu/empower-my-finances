@@ -25,7 +25,7 @@ function grab(name) {
 const names = [
   'seriesFrom', 'flattenHistory', 'accountTypeById', 'changeAt', 'chartChange',
   'lastChange', 'selectedChange', 'txnNet', 'reconcile', 'reconciledSpan',
-  'accountNames', 'indexOfDay', 'dayKey', 'isLive', 'normalise',
+  'accountNames', 'lastReported', 'indexOfDay', 'dayKey', 'isLive', 'normalise',
 ];
 
 const ctx = {
@@ -317,9 +317,14 @@ ctx.series = ctx.seriesFrom(hist(driftRows), dailyTxns);
 ctx.txns = dailyTxns;
 
 eq('the interest is attributed to the bank, by name',
-  ctx.reconcile('2026-07-24', '2026-07-24'), [{ id: '1', name: 'Checking', amount: 5 }]);
+  ctx.reconcile('2026-07-24', '2026-07-24'),
+  [{ id: '1', name: 'Checking', amount: 5, stale: false, since: '' }]);
 eq('the card fee is attributed to the card',
-  ctx.reconcile('2026-07-22', '2026-07-22'), [{ id: '2', name: 'Blue Card', amount: -12 }]);
+  ctx.reconcile('2026-07-22', '2026-07-22'),
+  [{ id: '2', name: 'Blue Card', amount: -12, stale: false, since: '' }]);
+// Both accounts reported on both days, so this is money, not reporting.
+eq('a reporting account yields a real discrepancy',
+  ctx.reconcile('2026-07-24', '2026-07-24')[0].stale, false);
 eq('over the whole week, both show up biggest first',
   ctx.reconcile('2026-07-21', '2026-07-24').map((g) => [g.name, g.amount]),
   [['Blue Card', -12], ['Checking', 5]]);
@@ -351,6 +356,46 @@ eq('otherwise it is the graph, from its second point',
 eq('the first point cannot be reconciled', ctx.reconcile('2026-07-20', '2026-07-20'), []);
 ctx.txns = null;
 eq('nor can anything without the transactions', ctx.reconcile('2026-07-24', '2026-07-24'), []);
+
+// ---------------------------------------------------------------------------
+section('an account that has gone quiet is not an account with a discrepancy');
+// The card reports 2000 owed on the 20th and nothing until the 28th at 2650.
+// Its two purchases come to 600, so the gap does not reconcile (a 50 fee never
+// posted) and the balance carries. Measured naively, every day in the silence
+// looks like unexplained money, and the whole silence lands on the 28th.
+noToday();
+const quietRows = [...bankRows, [CARD, '2026-07-20', 2000], [CARD, '2026-07-28', 2650]];
+ctx.series = ctx.seriesFrom(hist(quietRows), spend);
+ctx.txns = spend;
+eq('the gap did not reconcile, so the card is carried',
+  ctx.series[5].held.has('2'), true);
+eq('the bank reported, so it is not', ctx.series[5].held.has('1'), false);
+
+// The 25th: a 400 purchase the card's balance knows nothing about yet.
+const quiet = ctx.reconcile('2026-07-25', '2026-07-25');
+eq('the day of a purchase during the silence', [quiet[0].name, quiet[0].amount], ['Blue Card', 400]);
+eq('...is reported as a balance that has not caught up', quiet[0].stale, true);
+eq('...naming when the account last spoke', quiet[0].since, '2026-07-20');
+
+// The 28th: the balance finally arrives, carrying the whole week at once.
+const resumed = ctx.reconcile('2026-07-28', '2026-07-28');
+eq('the day it resumes carries the whole silence', resumed[0].amount, -650);
+eq('...and is still a reporting story, not a money one', resumed[0].stale, true);
+
+// Across the whole silence, both ends reported, so what is left is the real
+// 50 that no transaction accounts for.
+const whole = ctx.reconcile('2026-07-21', '2026-07-28');
+eq('end to end, only the genuine shortfall remains',
+  whole.filter((g) => g.id === '2').map((g) => [g.amount, g.stale]), [[-50, false]]);
+
+// The invariant holds throughout: listed plus reconciling equals the balances.
+for (const [a, b] of [['2026-07-25', '2026-07-25'], ['2026-07-28', '2026-07-28'], ['2026-07-21', '2026-07-28']]) {
+  ctx.selFrom = a;
+  ctx.selTo = b;
+  const sum = ctx.txnNet(a, b).sum + ctx.reconcile(a, b).reduce((s, g) => s + g.amount, 0);
+  eq(`${a}→${b}: the list still adds up`, Math.round(sum * 100) / 100, ctx.selectedChange().delta);
+}
+ctx.selFrom = ctx.selTo = null;
 
 Date.now = realNow;
 console.log(fails ? `\n${fails} FAILED` : '\nall passed');

@@ -576,8 +576,12 @@
       // what it is really comparing.
       let fresh = 0;
       let worked = 0;
+      const held = new Set();
       for (const [id, vals] of known) {
-        if (!vals.has(day)) continue;
+        if (!vals.has(day)) {
+          if (carry.has(id)) held.add(id);
+          continue;
+        }
         carry.set(id, vals.get(day));
         if (derived.get(id).has(day)) worked++;
         else fresh++;
@@ -597,6 +601,10 @@
         // the graph and the transaction list can be attributed to the account
         // it came from. A copy: `carry` goes on being mutated.
         parts: new Map(carry),
+        // Which of them are carried rather than known today. A carried balance
+        // is not a statement about this day, so any difference measured against
+        // it is a statement about reporting, not about money.
+        held,
       });
     }
     return out;
@@ -1530,16 +1538,41 @@
     }
 
     const names = accountNames();
+    const openPt = series[lo];
+    const closePt = series[Math.max(i, j)];
     const out = [];
     for (const [id, after] of closing) {
       // An account with no opening balance hasn't moved as far as we can tell.
       const moved = after - (opening.has(id) ? opening.get(id) : after);
       const diff = Math.round((moved - (net.get(id) || 0)) * 100) / 100;
       if (!diff) continue;
-      out.push({ id, name: names.get(id) || 'an account', amount: diff });
+      // A balance carried across one or both ends of the span isn't a
+      // statement about these days, so the difference measured against it is a
+      // statement about *reporting*, not about money. Calling that "unexplained"
+      // would be a confident accusation about an account that simply hasn't
+      // spoken — and it points the wrong way twice over: the transactions look
+      // unexplained while the account is quiet, then the whole silence lands as
+      // one lump on the day it resumes. Same number either way; only the story
+      // it tells is different, and the story is the reason for the row.
+      const stale = openPt.held.has(id) || closePt.held.has(id);
+      out.push({
+        id,
+        name: names.get(id) || 'an account',
+        amount: diff,
+        stale,
+        since: stale ? lastReported(id, Math.max(i, j)) : '',
+      });
     }
     // Biggest discrepancy first — that's the one worth chasing.
     return out.sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount));
+  }
+
+  // The most recent day this account said anything, at or before `upto`.
+  function lastReported(id, upto) {
+    for (let k = upto; k >= 0; k--) {
+      if (!series[k].held.has(id)) return dayKey(series[k].date);
+    }
+    return '';
   }
 
   // The days the transaction list is currently reconciled over: the selection
@@ -2117,14 +2150,25 @@
     const when = span.from === span.to ? `on ${span.from}` : `${span.from} → ${span.to}`;
     return gaps
       .map((g) => {
-        const title =
-          `${g.name} moved ${signed(g.amount)} ${when} with no transaction to show ` +
-          `for it. Interest or a fee, a charge that has hit the balance but not ` +
-          `posted as a row yet, or a transaction Empower didn't return.`;
+        // Two different things, and the difference is what you would do about
+        // them. Unexplained money is a reason to go and look at a statement.
+        // A balance that hasn't been reported is a reason to do nothing at all
+        // and let it catch up.
+        const what = g.stale
+          ? `Not in the balance yet — ${g.name} last reported ${g.since || 'some time ago'}`
+          : `Unexplained ${g.amount < 0 ? 'decrease' : 'increase'} — not in the transactions`;
+        const title = g.stale
+          ? `${g.name} has not reported a balance since ${g.since || 'before this span'}, ` +
+            `so the graph doesn't show these days yet. Nothing is wrong; the figure is ` +
+            `the amount by which the list runs ahead of the balance, and it will ` +
+            `disappear when the account next syncs.`
+          : `${g.name} moved ${signed(g.amount)} ${when} with no transaction to show ` +
+            `for it. Interest or a fee, a charge that has hit the balance but not ` +
+            `posted as a row yet, or a transaction Empower didn't return.`;
         return (
-          `<tr class="ecd-d-recon" title="${escapeHtml(title)}">` +
+          `<tr class="ecd-d-recon${g.stale ? ' ecd-d-stale' : ''}" title="${escapeHtml(title)}">` +
           `<td class="ecd-d-date"></td>` +
-          `<td>Unexplained ${g.amount < 0 ? 'decrease' : 'increase'} — not in the transactions</td>` +
+          `<td>${escapeHtml(what)}</td>` +
           `<td class="ecd-d-acct">${escapeHtml(g.name)}</td>` +
           `<td class="ecd-d-amt ${g.amount < 0 ? 'ecd-d-out' : 'ecd-d-in'}">${signed(g.amount)}</td></tr>`
         );
@@ -2572,6 +2616,10 @@
      rule and italics say so without needing a heading to explain it. */
   #ecd-detail .ecd-d-recon td{border-top:2px solid rgba(128,128,128,.45);
     font-style:italic;opacity:.85}
+  /* A balance that hasn't caught up is not a discrepancy to chase, so it does
+     not wear the red or green that says money moved. */
+  #ecd-detail .ecd-d-stale td,
+  #ecd-detail .ecd-d-stale .ecd-d-amt{color:inherit;opacity:.6}
   #ecd-pick-banner{position:fixed;top:0;left:0;right:0;z-index:2147483002;
     background:#0f2942;color:#fff;padding:11px;text-align:center;
     font:600 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}

@@ -353,6 +353,21 @@ They also appear when nothing else matches. A selected day with no transactions
 whose balance moved anyway is the case they exist for — without them the view
 would say "nothing happened" over a graph that visibly stepped.
 
+**An account that has gone quiet is not an account with a discrepancy.** Where a
+balance is *carried* at either end of the span — a gap the transactions couldn't
+reconcile — the difference measured against it is a statement about reporting,
+not about money, and the row says so instead: `Not in the balance yet — Blue Card
+last reported 2026-07-20`. It is greyed rather than coloured, because there is
+nothing to chase; it will disappear when the account next syncs.
+
+The distinction matters because the naive reading points the wrong way twice
+over. A card that goes quiet on the 20th and resurfaces on the 28th has a
+balance that knows nothing of the week in between, so a purchase on the 25th
+looks like unexplained money while the account is silent — and then the whole
+silence lands as one lump on the 28th. Same numbers either way; only the story
+changes, and the story is the entire reason for the row. Measured end to end,
+with both ends reported, what is left is the genuine shortfall.
+
 ### Filtering the transaction list
 
 The transactions heading is a toolbar: the heading on the left, a **search box**
