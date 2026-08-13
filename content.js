@@ -514,7 +514,7 @@
   //      the accounts payload, which is a reading for today like any other and
   //      a fresher one than history's
   //   2. what the dated transactions say it must have been, across a gap whose
-  //      two ends both reported and whose transactions add up to the difference
+  //      two ends both reported
   //   3. its last known balance, carried
   //
   // (2) is why transactions are loaded for the graph and not just the detail
@@ -522,15 +522,17 @@
   // but it moves the account's whole gap onto the day it resumes: a card silent
   // for a week posts seven days of spending as a single step, and the daily
   // change reads that step as one day's worth. We know when the money actually
-  // moved — the transactions are dated — so where those dated movements account
-  // for the gap exactly, they walk the balance across it day by day instead.
+  // moved — the transactions are dated — so those dated movements walk the
+  // balance across the gap day by day instead.
   //
-  // "Exactly" is the safeguard, and it is the whole of it. A gap is only filled
-  // when its transactions reconcile to the cent against the balances at both
-  // ends. A pending charge, an interest posting, a transaction window that
-  // doesn't reach back far enough — any of them and the sums won't meet, which
-  // means the gap isn't understood, and it carries forward as before rather
-  // than being filled with something plausible-looking.
+  // The reading at the far end is the safeguard, not a reconciliation test. The
+  // transactions are laid down whether or not they add up: requiring them to
+  // meet the balance to the cent refused almost every real window — one fee or
+  // one unposted charge and the gap carried flat — so in practice nothing ever
+  // derived. Each anchor is left exactly as reported, so the line snaps back to
+  // a known figure and whatever the transactions failed to explain surfaces
+  // there as a single residual, disclosed by the reconciling rows. See the loop
+  // below for the whole of that argument.
   function seriesFrom(json, movements) {
     const typeById = accountTypeById();
     const perAcct = new Map(); // id → Map(day → signed balance)
