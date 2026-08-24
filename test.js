@@ -41,6 +41,7 @@ const names = [
   'seriesFrom', 'flattenHistory', 'accountTypeById', 'changeAt', 'chartChange',
   'lastChange', 'selectedChange', 'txnNet', 'reconcile', 'reconciledSpan',
   'accountNames', 'lastReported', 'totalsAt', 'residuals', 'postedDay', 'indexOfDay', 'dayKey', 'isLive', 'normalise',
+  'accountIdByName', 'resolveAcctId',
 ];
 
 const ctx = {
@@ -224,6 +225,128 @@ eq('a card payment nets to zero on the day it clears',
   values(s4), [['20', 3000], ['21', 3000], ['22', 3000], ['23', 3000], ['24', 3000]]);
 eq('both legs were derived, neither carried', [s4[2].fresh, s4[2].derived], [0, 2]);
 eq('the quiet days between two readings are filled in too', s4.length, 5);
+
+// The two legs of a real payment routinely clear a day apart: the bank debits
+// today, the card doesn't credit the payment until tomorrow. Unpaired, that
+// reads as a $500 dip that snaps back the next day — a payment is not a $500
+// swing in net cash and should not draw as one. markPairs() links the legs
+// (.paired / .mate); seriesFrom() must use that link to smooth the total.
+const legOut = txn(BANK, '2026-07-22', -500);
+const legIn = txn(CARD, '2026-07-23', 500);
+legOut.paired = true; legIn.paired = true;
+legOut.mate = legIn; legIn.mate = legOut;
+const staggeredPay = loaded([legOut, legIn]);
+const s4b = ctx.seriesFrom(hist(payRows), staggeredPay);
+eq('a payment that clears a day apart still nets to zero throughout',
+  values(s4b), [['20', 3000], ['21', 3000], ['22', 3000], ['23', 3000], ['24', 3000]]);
+
+// An unpaired pair of transactions of equal and opposite size still swings —
+// smoothing only applies to legs markPairs() actually linked.
+const legOutAlone = txn(BANK, '2026-07-22', -500);
+const legInAlone = txn(CARD, '2026-07-23', 500);
+const unpaired = loaded([legOutAlone, legInAlone]);
+const s4c = ctx.seriesFrom(hist(payRows), unpaired);
+eq('without the link, the day between the two legs still dips',
+  values(s4c), [['20', 3000], ['21', 3000], ['22', 2500], ['23', 3000], ['24', 3000]]);
+
+// The total nets to zero either way once both legs are in, but the point of
+// linking the pair is that Cash and CCds move *together* — the smoothing
+// should show up on the individual totals a card payment splits across, not
+// just paper over the gap in the sum.
+eq('linked: cash and card debt drop on the same day, the day the money left',
+  ctx.totalsAt(s4b[2]), { BANK: 4500, CREDIT_CARD: 1500 });
+eq('...the day before, neither has moved yet',
+  ctx.totalsAt(s4b[1]), { BANK: 5000, CREDIT_CARD: 2000 });
+eq('unlinked: cash drops a day before card debt catches up',
+  ctx.totalsAt(s4c[2]), { BANK: 4500, CREDIT_CARD: 2000 });
+eq('...card debt only catches up once its own leg posts',
+  ctx.totalsAt(s4c[3]), { BANK: 4500, CREDIT_CARD: 1500 });
+
+// A transfer between two of the user's own bank accounts is the same shape as
+// a card payment — money leaves one, lands in the other, nets to zero — and
+// isTransferShape() already allows bank→bank, so markPairs() links it the
+// same way. A large transfer can take a few business days to land, so the
+// smoothing has to hold over more than a one-day gap, not just the card
+// payment's one-day case tested above.
+const BANK2 = 3;
+const savedAccounts = ctx.rawAccounts;
+ctx.rawAccounts = [
+  { userAccountId: BANK, productType: 'BANK', balance: 0, name: 'Checking' },
+  { userAccountId: BANK2, productType: 'BANK', balance: 0, name: 'Savings' },
+];
+const xferRows = [
+  [BANK, '2026-07-20', 5000], [BANK, '2026-07-26', 4000],
+  [BANK2, '2026-07-20', 3000], [BANK2, '2026-07-26', 4000],
+];
+const xferOut = txn(BANK, '2026-07-22', -1000);
+const xferIn = txn(BANK2, '2026-07-25', 1000);
+xferOut.paired = true; xferIn.paired = true;
+xferOut.mate = xferIn; xferIn.mate = xferOut;
+const sx = ctx.seriesFrom(hist(xferRows), loaded([xferOut, xferIn]));
+eq('a bank-to-bank transfer 3 days apart nets to zero throughout',
+  values(sx),
+  [['20', 8000], ['21', 8000], ['22', 8000], ['23', 8000], ['24', 8000], ['25', 8000], ['26', 8000]]);
+
+// getHistories and getUserTransactions are two different calls, and nothing
+// guarantees they spell an account's id the same way. Pairing survives a
+// mismatch — markPairs() matches by amount — but placing a transaction
+// against one specific account's balance needs its id to actually resolve,
+// and a row that doesn't line up should recover through its account name
+// rather than silently never landing on the right account again.
+const typeById = ctx.accountTypeById();
+const idByName = ctx.accountIdByName();
+eq('a known id is used as-is',
+  ctx.resolveAcctId({ userAccountId: BANK }, typeById, idByName), String(BANK));
+eq('an id from a scheme getHistories never used falls back to the name',
+  ctx.resolveAcctId({ userAccountId: 999999, accountName: 'Savings' }, typeById, idByName),
+  String(BANK2));
+eq('no id at all still resolves by name',
+  ctx.resolveAcctId({ accountName: 'Checking' }, typeById, idByName), String(BANK));
+eq('an unrecognised name is the last resort, same as before the fallback existed',
+  ctx.resolveAcctId({ accountName: 'Some External Account' }, typeById, idByName),
+  'Some External Account');
+
+// The bug this exists for: a transfer whose rows carry an id getHistories
+// never used, resolved only by account name. Without the name fallback this
+// pair would still show as netted in the list (amount-based) while the graph
+// kept swinging (moved()/acctAdj never placed it on a real account).
+const xferOutBadId = { ...txn(999999, '2026-07-22', -1000), accountName: 'Checking' };
+const xferInBadId = { ...txn(999998, '2026-07-25', 1000), accountName: 'Savings' };
+xferOutBadId.acctId = ctx.resolveAcctId(xferOutBadId, typeById, idByName);
+xferInBadId.acctId = ctx.resolveAcctId(xferInBadId, typeById, idByName);
+xferOutBadId.paired = true; xferInBadId.paired = true;
+xferOutBadId.mate = xferInBadId; xferInBadId.mate = xferOutBadId;
+const sxBadId = ctx.seriesFrom(hist(xferRows), loaded([xferOutBadId, xferInBadId]));
+eq('resolved by name, the mismatched-id transfer still smooths',
+  values(sxBadId),
+  [['20', 8000], ['21', 8000], ['22', 8000], ['23', 8000], ['24', 8000], ['25', 8000], ['26', 8000]]);
+
+// The bug a live transfer actually hit: the destination leg's own date (23rd)
+// isn't the day its balance really moved (the 25th) — no posted-date field
+// was recognisable enough to prefer, so it fell back to a date that was wrong
+// by two days. Anchoring the correction on that wrong date used to pull it
+// onto the 22nd — a day neither side had moved on yet — leaving the 23rd and
+// 24th to dip for real. Both accounts report daily here (no gap for moved()
+// to fill), so the fix has to find the 25th by searching the real reported
+// figures for the day whose own step actually matches the leg's amount.
+const misdatedRows = [
+  [BANK, '2026-07-20', 5000], [BANK, '2026-07-21', 5000], [BANK, '2026-07-22', 4000],
+  [BANK, '2026-07-23', 4000], [BANK, '2026-07-24', 4000], [BANK, '2026-07-25', 4000],
+  [BANK, '2026-07-26', 4000],
+  [BANK2, '2026-07-20', 3000], [BANK2, '2026-07-21', 3000], [BANK2, '2026-07-22', 3000],
+  [BANK2, '2026-07-23', 3000], [BANK2, '2026-07-24', 3000], [BANK2, '2026-07-25', 4000],
+  [BANK2, '2026-07-26', 4000],
+];
+const misdatedOut = txn(BANK, '2026-07-22', -1000);
+const misdatedIn = txn(BANK2, '2026-07-23', 1000); // really lands on the 25th
+misdatedOut.paired = true; misdatedIn.paired = true;
+misdatedOut.mate = misdatedIn; misdatedIn.mate = misdatedOut;
+const smis = ctx.seriesFrom(hist(misdatedRows), loaded([misdatedOut, misdatedIn]));
+eq('the correction follows the balance, not the mis-dated row',
+  values(smis),
+  [['20', 8000], ['21', 8000], ['22', 8000], ['23', 8000], ['24', 8000], ['25', 8000], ['26', 8000]]);
+
+ctx.rawAccounts = savedAccounts;
 
 // ---------------------------------------------------------------------------
 section('live balances as today\'s reading');

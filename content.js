@@ -11,7 +11,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.29.0';
+  const VERSION = '0.35.0';
 
   // The same file is injected into both the page's MAIN world (where
   // `window.csrf` is reachable) and the extension's ISOLATED world (which
@@ -499,6 +499,40 @@
     return m;
   }
 
+  // The account id, keyed by name — the fallback for resolveAcctId() below.
+  function accountIdByName() {
+    const m = new Map();
+    for (const a of rawAccounts) {
+      const id = a.userAccountId ?? a.accountId ?? a.id;
+      const name = a.name || a.originalName || '';
+      if (id != null && name) m.set(name, String(id));
+    }
+    return m;
+  }
+
+  // A transaction row's account id, cross-checked against the accounts we
+  // actually know rather than trusted at face value.
+  //
+  // getHistories and getUserTransactions are two separate calls, and nothing
+  // guarantees they name an account's id the same way. Pairing survives that —
+  // markPairs() matches on amount, not id — but everything downstream that has
+  // to *place* a transaction against one specific account's balance (moved(),
+  // and the net-payment smoothing it feeds) is keyed on this id lining up with
+  // the one getHistories used. When a row's own id doesn't resolve to an
+  // account we know, its accountName usually still does, so try that before
+  // falling back to the id (or the name itself) as before — recovering a real
+  // account id is better than silently never being placeable anywhere again.
+  function resolveAcctId(t, typeById, idByName) {
+    const numericId = t.userAccountId ?? t.accountId;
+    const acctId = numericId != null ? String(numericId) : '';
+    if (!typeById.has(acctId)) {
+      const byName = idByName.get(t.accountName || '');
+      if (byName) return byName;
+      if (!acctId) return String(t.accountName || '');
+    }
+    return acctId;
+  }
+
   // Net cash per day, summed over the *same* accounts every day.
   //
   // Summing whatever reported on each date is what makes this wrong: accounts
@@ -692,6 +726,82 @@
       derived.set(id, from);
     }
 
+    // A net payment — money leaving one account and landing in another, e.g. a
+    // card payment — nets to zero and should read as zero everywhere it's
+    // shown: on the total, and on cash and card debt individually, which
+    // should visibly move together rather than one dipping a day before the
+    // other catches up. Both legs post on different days — the bank debits
+    // today, the card doesn't credit the payment until tomorrow — and are real
+    // and correctly dated on their own account, so this is a display
+    // correction layered on top of the real figures, not a rewrite of them:
+    // residuals() and reconcile() still work from the real, unsmoothed `parts`.
+    //
+    // The leg's own date is not reliable enough to anchor that correction on.
+    // It is the day a build says the money moved, and that is exactly the
+    // thing this whole file already distrusts for cards — a charge is dated
+    // when made, not when it posts, which is the entire reason moved() and
+    // postedDay() exist. A transfer's rows can be just as loose: an
+    // "Electronic Deposit" row dated two days before the destination
+    // account's own balance actually shows it, with no posted-date field
+    // recognisable enough to prefer. Anchoring the correction on that date
+    // pulls it onto a day when *neither* side had moved yet, manufacturing a
+    // dip that wasn't in the raw figures at all, rather than removing the one
+    // that was. `known` has just been filled in with every account's real
+    // per-day figure — including days derived from moved() — so look there
+    // for the day nearest the leg's own date whose step actually matches its
+    // amount, and prefer that when one exists.
+    const REAL_DAY_SEARCH_MS = 14 * DAY_MS;
+    function realStepDay(acctId, amount, aroundDay) {
+      const vals = known.get(acctId);
+      const target = cents(amount);
+      if (!vals || !aroundDay || !target) return aroundDay;
+      let bestDay = aroundDay;
+      let bestGap = Infinity;
+      let prevVal = null;
+      for (const d of [...vals.keys()].sort()) {
+        const v = vals.get(d);
+        if (prevVal !== null && cents(v) - cents(prevVal) === target) {
+          const gap = Math.abs(Date.parse(d) - Date.parse(aroundDay));
+          if (gap <= REAL_DAY_SEARCH_MS && gap < bestGap) {
+            bestGap = gap;
+            bestDay = d;
+          }
+        }
+        prevVal = v;
+      }
+      return bestDay;
+    }
+
+    // markPairs() already found these pairs. For each one whose legs' real
+    // days differ, the leg that lands *later* is pulled forward onto its own
+    // account: its amount is added to that account's total for every day from
+    // the earlier leg's real day up to (not including) the later one — as if
+    // the payment cleared both sides the moment the money actually left. Once
+    // the later day arrives, the real data already includes it and the
+    // correction stops on its own. Summed across accounts this is exactly the
+    // total's own correction, so the two stay consistent with each other by
+    // construction rather than needing to agree by coincidence.
+    const acctAdj = new Map(); // acctId → Map(day → correction)
+    const seenPair = new Set();
+    for (const t of movements || []) {
+      if (!t || !t.paired || !t.mate || seenPair.has(t)) continue;
+      seenPair.add(t);
+      seenPair.add(t.mate);
+      if (!perAcct.has(t.acctId) || !perAcct.has(t.mate.acctId)) continue;
+      const d1 = realStepDay(t.acctId, t.amount, balanceDay(t));
+      const d2 = realStepDay(t.mate.acctId, t.mate.amount, balanceDay(t.mate));
+      if (!d1 || !d2 || d1 === d2) continue;
+      const late = d1 < d2 ? t.mate : t;
+      const early = d1 < d2 ? d1 : d2;
+      const lateDay = d1 < d2 ? d2 : d1;
+      if (!isFinite(late.amount)) continue;
+      if (!acctAdj.has(late.acctId)) acctAdj.set(late.acctId, new Map());
+      const m = acctAdj.get(late.acctId);
+      for (let d = early; d < lateDay; d = nextDay(d)) {
+        m.set(d, (m.get(d) || 0) + late.amount);
+      }
+    }
+
     // A day is worth drawing if anyone reported on it or anyone can be shown to
     // have been at a particular balance on it. A day where every account is
     // merely carrying holds no information, and drawing a point for it implies
@@ -718,8 +828,18 @@
       }
       // Days before the start still build up `carry`; they just aren't drawn.
       if (day < start) continue;
+      // The smoothing correction for this day, per account that has one — kept
+      // alongside `parts` rather than folded into it, so totalsAt() can show
+      // the smoothed figure while residuals() and reconcile() keep comparing
+      // against what was actually reported.
+      const adj = new Map();
       let sum = 0;
-      for (const v of carry.values()) sum += v;
+      for (const [id, v] of carry) {
+        const am = acctAdj.get(id);
+        const a = am ? am.get(day) || 0 : 0;
+        if (a) adj.set(id, a);
+        sum += v + a;
+      }
       out.push({
         date: day,
         value: sum,
@@ -731,6 +851,8 @@
         // the graph and the transaction list can be attributed to the account
         // it came from. A copy: `carry` goes on being mutated.
         parts: new Map(carry),
+        // The smoothing correction behind `value`, by account — see above.
+        adj,
         // Which of them are carried rather than known today. A carried balance
         // is not a statement about this day, so any difference measured against
         // it is a statement about reporting, not about money.
@@ -852,10 +974,11 @@
     const rows = (json && json.spData && json.spData.transactions) || [];
     postKeyUsed = '';
     const typeById = accountTypeById();
+    const idByName = accountIdByName();
     const out = rows
       .map((t) => {
         const amt = Number(t.amount);
-        const acctId = String(t.userAccountId ?? t.accountId ?? t.accountName ?? '');
+        const acctId = resolveAcctId(t, typeById, idByName);
         const day = dayKey(t.transactionDate || t.date || '');
         return {
           date: t.transactionDate || t.date || '',
@@ -932,6 +1055,7 @@
     const groups = new Map();
     for (const t of rows) {
       t.paired = false;
+      t.mate = null;
       const key = Math.round(Math.abs(t.amount) * 100);
       if (!key) continue; // a zero-amount row pairs with everything
       if (!groups.has(key)) groups.set(key, []);
@@ -952,6 +1076,11 @@
         if (mate) {
           mate.paired = true;
           out.paired = true;
+          // The link, not just the flag: seriesFrom() needs to find the other
+          // leg's day and amount to smooth the graph across a pair that posts
+          // on two different days.
+          mate.mate = out;
+          out.mate = mate;
         }
       }
     }
@@ -1958,13 +2087,21 @@
   // payload, over a day that has already been. Cards come back out as a
   // positive amount owed, which is the shape subHtml() and the headline both
   // expect; the series holds them the other way up.
+  //
+  // point.adj carries seriesFrom()'s net-payment smoothing — a card payment
+  // whose two legs post a day apart otherwise reads as cash dropping today and
+  // card debt not catching up until tomorrow. Applying it here means the Cash
+  // and CCds figures move together, the same day, matching the graph they sit
+  // under. residuals() and reconcile() read point.parts directly and are
+  // unaffected — this is a display figure, not a rewrite of what was reported.
   function totalsAt(point) {
     if (!point || !point.parts) return null;
     const typeById = accountTypeById();
     const t = { BANK: 0, CREDIT_CARD: 0 };
     for (const [id, v] of point.parts) {
-      if (typeById.get(id) === 'CREDIT_CARD') t.CREDIT_CARD += -v;
-      else t.BANK += v;
+      const vv = point.adj && point.adj.has(id) ? v + point.adj.get(id) : v;
+      if (typeById.get(id) === 'CREDIT_CARD') t.CREDIT_CARD += -vv;
+      else t.BANK += vv;
     }
     return t;
   }
@@ -1989,7 +2126,7 @@
     return (
       `<span class="ecd-sub-l">Cash</span>` +
       `<span class="ecd-sub-n">${money(t.BANK)}</span>` +
-      `<span class="ecd-sub-l">Cards</span>` +
+      `<span class="ecd-sub-l">CCds</span>` +
       `<span class="ecd-sub-n">−${money(t.CREDIT_CARD)}</span>`
     );
   }
@@ -2833,6 +2970,84 @@
       const r = buildReport();
       console.log(JSON.stringify(r, null, 2));
       return r;
+    };
+  } catch (_) {}
+
+  // Why a specific matched pair isn't smoothing on the graph, without having
+  // to guess: shows exactly what the code resolved each leg's account id and
+  // placement day to, and whether that id is one the graph itself recognises
+  // — the two things net-payment smoothing depends on that pairing itself
+  // doesn't. Filter by amount (dollars, either sign) or a snippet of the
+  // description to find one pair in a long list.
+  try {
+    window.ecdPairDebug = function (filter) {
+      if (!txns) return 'transactions not loaded yet';
+      const histIds = new Set(
+        (historyJson ? flattenHistory(historyJson.spData) : []).map((h) => String(h.id))
+      );
+      const describe = (t) =>
+        t && {
+          desc: t.desc,
+          account: t.account,
+          acctId: t.acctId,
+          type: t.type || '(unresolved)',
+          amount: t.amount,
+          day: t.day,
+          postDay: t.postDay || '(none)',
+          balanceDay: balanceDay(t),
+          idKnownToGraph: histIds.has(t.acctId),
+        };
+      let rows = txns.filter((t) => t.paired);
+      if (filter !== undefined) {
+        const n = Number(filter);
+        rows = rows.filter((t) =>
+          isFinite(n) && n
+            ? Math.round(Math.abs(t.amount) * 100) === Math.round(Math.abs(n) * 100)
+            : (t.desc || '').toLowerCase().includes(String(filter).toLowerCase())
+        );
+      }
+      // Each pair otherwise appears twice — once from each leg's own row.
+      const seen = new Set();
+      rows = rows.filter((t) => {
+        if (seen.has(t)) return false;
+        seen.add(t);
+        seen.add(t.mate);
+        return true;
+      });
+      const out = rows.map((t) => ({
+        leg: describe(t),
+        mate: describe(t.mate),
+        sameDay: t.mate ? balanceDay(t) === balanceDay(t.mate) : null,
+      }));
+      console.log(JSON.stringify(out, null, 2));
+      return out;
+    };
+  } catch (_) {}
+
+  // The series the graph is actually drawing from, around a given date — so a
+  // swing can be checked against what seriesFrom() really produced rather than
+  // against what it should have. Shows each point's total, which accounts
+  // carried a smoothing correction that day (adj), and the raw per-account
+  // balances behind it (parts) so a specific account's figure can be read off
+  // directly. `day` is any YYYY-MM-DD near the swing; `spread` is how many
+  // points to show on each side of the nearest match.
+  try {
+    window.ecdSeriesDebug = function (day, spread) {
+      if (!series || !series.length) return 'series not built yet';
+      spread = spread || 3;
+      const i = indexOfDay(series, day);
+      if (i === null) return 'no series point near that date';
+      const lo = Math.max(0, i - spread);
+      const hi = Math.min(series.length - 1, i + spread);
+      const out = series.slice(lo, hi + 1).map((p) => ({
+        date: p.date,
+        value: p.value,
+        adj: p.adj && p.adj.size ? Object.fromEntries(p.adj) : null,
+        parts: Object.fromEntries(p.parts),
+        held: [...p.held],
+      }));
+      console.log(JSON.stringify(out, null, 2));
+      return out;
     };
   } catch (_) {}
 
